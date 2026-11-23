@@ -2074,6 +2074,7 @@ struct DotButton : TextButton, Timer
     enum class OnStyle { grey, redSoft, redSolid };
     int beatLight = 0;   // metro: 0 idle, 1 first beat of the bar, 2 other beats
     OnStyle onStyle = OnStyle::grey;
+    bool borderless = false;   // small icon-only buttons (device cards): no outline, soft circle on hover
     DotButton (const String& label, Glyph g, const String& tip) : TextButton (label), glyph (g) { setTooltip (tip); setWantsKeyboardFocus (false); }
 
     static const char* rows (Glyph g)
@@ -2122,8 +2123,15 @@ struct DotButton : TextButton, Timer
         }
         auto r = getLocalBounds().toFloat().reduced (0.5f);
         const float rad = iconOnly ? r.getHeight() / 2 : jmin (10.0f, r.getHeight() / 2);
-        g.setColour (bg); g.fillRoundedRectangle (r, rad);
-        g.setColour (border); g.drawRoundedRectangle (r, rad, 1.0f);
+        if (borderless)
+        {
+            if (over || on) { g.setColour (on ? Colour (0xffe9e9e9) : C::subtle); g.fillEllipse (r); }
+        }
+        else
+        {
+            g.setColour (bg); g.fillRoundedRectangle (r, rad);
+            g.setColour (border); g.drawRoundedRectangle (r, rad, 1.0f);
+        }
 
         const auto font = sw::label (jlimit (8.0f, 10.0f, getHeight() * 0.38f));
         const float textW = iconOnly ? 0.0f : (float) GlyphArrangement::getStringWidth (font, getButtonText());
@@ -2138,7 +2146,7 @@ struct DotButton : TextButton, Timer
             for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
                 g.fillRoundedRectangle (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d, d * 0.28f);
         }
-        auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * 0.28f); };
+        auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * (borderless ? 0.45f : 0.28f)); };
         if (auto* bits = rows (glyph))
         {
             const float y0 = getHeight() / 2.0f - step * 3.5f;
@@ -2178,7 +2186,7 @@ struct DeviceChain : Component
     {
         Card (Session& s, te::AudioTrack& t, te::Plugin& p) : session (s), track (&t), plugin (&p)
         {
-            for (auto* b : { &power, &open, &left, &right, &dup, &del }) addAndMakeVisible (b);
+            for (auto* b : { &power, &open, &left, &right, &dup, &del }) { b->borderless = true; addAndMakeVisible (b); }
             power.setClickingTogglesState (true);
             power.setToggleState (p.isEnabled(), dontSendNotification);
             power.onClick = [this] { plugin->setEnabled (power.getToggleState()); repaint(); };
@@ -2258,13 +2266,13 @@ struct DeviceChain : Component
         {
             auto r = getLocalBounds().reduced (14, 10);
             r.removeFromTop (36);
-            auto bar = r.removeFromBottom (24);   // [power][open]   [<][>]   [duplicate][delete]
+            auto bar = r.removeFromBottom (18);   // [power][open]   [<][>]   [duplicate][delete]
             const int b = bar.getHeight();
-            power.setBounds (bar.removeFromLeft (b)); bar.removeFromLeft (4);
+            power.setBounds (bar.removeFromLeft (b)); bar.removeFromLeft (2);
             open.setBounds (bar.removeFromLeft (b));
-            del.setBounds (bar.removeFromRight (b)); bar.removeFromRight (4);
+            del.setBounds (bar.removeFromRight (b)); bar.removeFromRight (2);
             dup.setBounds (bar.removeFromRight (b));
-            auto mid = bar.withSizeKeepingCentre (b * 2 + 4, b);
+            auto mid = bar.withSizeKeepingCentre (b * 2 + 2, b);
             left.setBounds (mid.removeFromLeft (b)); right.setBounds (mid.removeFromRight (b));
             r.removeFromBottom (6);
             const int cols = 4, cw = r.getWidth() / cols, ch = jmin (64, r.getHeight() / 2);
