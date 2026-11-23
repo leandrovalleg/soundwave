@@ -131,12 +131,46 @@ struct Session
 
     Session()
     {
+        if (File last (settings().getValue ("lastProject")); last.existsAsFile()) editFile = last;
         editFile.getParentDirectory().createDirectory();
-        edit = editFile.existsAsFile() ? te::loadEditFromFile (engine, editFile)
-                                       : te::createEmptyEdit (engine, editFile);
-        edit->ensureNumberOfAudioTracks (4);
+        open (editFile);
+    }
+
+    // Opens (or creates, if the file doesn't exist) a project; everything else re-reads session.edit.
+    void open (const File& f)
+    {
+        if (edit) { edit->getTransport().stop (false, true); save(); }
+        selTrack = nullptr; selClip = nullptr;
+        editFile = f;
+        edit = f.existsAsFile() ? te::loadEditFromFile (engine, f) : te::createEmptyEdit (engine, f);
+        if (! f.existsAsFile()) edit->ensureNumberOfAudioTracks (4);
         prepareSlots();
         edit->getTransport().ensureContextAllocated();
+        settings().setValue ("lastProject", f.getFullPathName()); settings().saveIfNeeded();
+        changed(); if (onSelect) onSelect();
+    }
+    void saveAs (const File& f)
+    {
+        te::EditFileOperations (*edit).saveAs (f, true, nullptr);
+        editFile = f;
+        settings().setValue ("lastProject", f.getFullPathName()); settings().saveIfNeeded();
+    }
+
+    te::MidiClip* addMidiClip (te::AudioTrack& t, int bar, int bars = 1)
+    {
+        auto& ts = edit->tempoSequence;
+        auto mc = te::insertMIDIClip (t, "MIDI", { ts.toTime (te::tempo::BarsAndBeats { .bars = bar }), ts.toTime (te::tempo::BarsAndBeats { .bars = bar + bars }) });
+        if (mc) { select (&t, mc.get()); changed(); }
+        return mc.get();
+    }
+    void duplicateSelected()
+    {
+        if (! alive (selClip.get()) || selClip->getClipSlot()) return;
+        if (auto c = te::duplicateClip (*selClip))
+        {
+            c->setStart (selClip->getPosition().getEnd(), false, true);
+            select (selTrack.get(), c.get()); changed();
+        }
     }
 
     void prepareSlots()
@@ -229,6 +263,7 @@ struct Session
         if (auto old = inputOf (t)) [[maybe_unused]] auto r = old->removeTarget (t.itemID, &edit->getUndoManager());
         if (in)
         {
+            in->getInputDevice().setEnabled (true);
             [[maybe_unused]] auto r = in->setTarget (t.itemID, true, &edit->getUndoManager(), 0);
             in->getInputDevice().setMonitorMode (isMidiIn (in) ? te::InputDevice::MonitorMode::on : te::InputDevice::MonitorMode::automatic);
             in->setRecordingEnabled (t.itemID, armed);
@@ -240,8 +275,14 @@ struct Session
     {
         auto in = inputOf (t);
         if (! in && on)
-            for (auto c : inputs())
-                if (isMidiIn (c) == (instrumentOf (t) != nullptr)) { setInput (t, c); in = c; break; }
+        {
+            ensureAudioInputsOpen();
+            auto all = inputs();
+            for (auto c : all)   // MIDI for instrument tracks, audio otherwise...
+                if (isMidiIn (c) == (instrumentOf (t) != nullptr)) { in = c; break; }
+            if (! in && ! all.isEmpty()) in = all.getFirst();   // ...or whatever exists
+            if (in) setInput (t, in);
+        }
         if (in) in->setRecordingEnabled (t.itemID, on);
         changed();
     }
@@ -252,8 +293,32 @@ struct Session
         auto& tc = edit->getTransport();
         if (tc.isRecording()) { tc.stop (false, false); changed(); return; }
         if (! anyArmed())
-            if (auto t = selTrack ? selTrack.get() : regularTracks().getFirst()) arm (*t, true);
+            if (auto t = selTrack && returnBus (*selTrack) < 0 ? selTrack.get() : regularTracks().getFirst()) arm (*t, true);
+        if (! anyArmed())
+        {
+            AlertWindow::showMessageBoxAsync (MessageBoxIconType::NoIcon, "GRABAR",
+                String::fromUTF8 ("No hay ninguna entrada para grabar.\n\nAbre SETTINGS > AUDIO, elige tu micrófono o interfaz en \"Input\" "
+                "(o conecta un teclado MIDI) y vuelve a pulsar REC."));
+            return;
+        }
         tc.record (false, false);
+        changed();
+    }
+
+    // If the sound card has inputs but none are open, open the first two so there is something to record.
+    void ensureAudioInputsOpen()
+    {
+        auto& dm = engine.getDeviceManager().deviceManager;
+        auto setup = dm.getAudioDeviceSetup();
+        auto* dev = dm.getCurrentAudioDevice();
+        if (dev && setup.inputChannels.isZero() && dev->getInputChannelNames().size() > 0)
+        {
+            setup.useDefaultInputChannels = false;
+            setup.inputChannels.setRange (0, jmin (2, dev->getInputChannelNames().size()), true);
+            dm.setAudioDeviceSetup (setup, true);
+            engine.getDeviceManager().rescanWaveDeviceList();
+            edit->getTransport().ensureContextAllocated (true);
+        }
     }
 
     // Every MIDI keyboard plays this track (like arming it), with live monitoring on.
@@ -675,6 +740,108 @@ struct Waveforms
 };
 
 //==============================================================================
+// I/O row: one per track, on the right of the TIMELINE (input, monitor, arm, volume, pan, output)
+struct IORow : Component
+{
+    IORow (Session& s, te::AudioTrack& t) : session (s), track (&t)
+    {
+        const bool ret = Session::returnBus (t) >= 0;
+        auto vol = t.getVolumePlugin();
+        volume.setSliderStyle (Slider::LinearBar); volume.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+        volume.setRange (-60.0, 6.0, 0.1); volume.setSkewFactorFromMidPoint (-12.0);
+        volume.setValue (vol->getVolumeDb(), dontSendNotification);
+        volume.setDoubleClickReturnValue (true, 0.0);
+        volume.onValueChange = [this, vol] { vol->setVolumeDb ((float) volume.getValue()); repaint(); };
+        pan.setSliderStyle (Slider::RotaryHorizontalVerticalDrag); pan.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+        pan.setRange (-1.0, 1.0, 0.01); pan.setValue (vol->getPan(), dontSendNotification);
+        pan.setDoubleClickReturnValue (true, 0.0);
+        pan.setTooltip ("Pan (doble clic = centro)");
+        pan.onValueChange = [this, vol] { vol->setPan ((float) pan.getValue()); };
+        for (auto* c : { (Component*) &volume, (Component*) &pan }) addAndMakeVisible (c);
+        if (ret) return;
+
+        input.setTooltip (String::fromUTF8 ("De dónde graba esta pista"));
+        input.onChange = [this]
+        {
+            auto ins = session.inputs();
+            const int i = input.getSelectedItemIndex() - 1;
+            session.setInput (*track, isPositiveAndBelow (i, ins.size()) ? ins[i] : nullptr);
+        };
+        arm.setClickingTogglesState (true);
+        arm.setColour (TextButton::buttonOnColourId, sw::colour::accent);
+        arm.setTooltip ("Armar para grabar");
+        arm.onClick = [this] { session.arm (*track, arm.getToggleState()); };
+        const char* modes[] { "IN", "AUTO", "OFF" };
+        for (int i = 0; i < 3; ++i)
+        {
+            auto* b = monitor.add (new Pill (modes[i]));
+            b->setRadioGroupId (100); b->setClickingTogglesState (true);
+            b->onClick = [this, i]
+            {
+                if (auto in = session.inputOf (*track))
+                    in->getInputDevice().setMonitorMode (i == 0 ? te::InputDevice::MonitorMode::on
+                                                         : i == 1 ? te::InputDevice::MonitorMode::automatic
+                                                                  : te::InputDevice::MonitorMode::off);
+            };
+            addAndMakeVisible (b);
+        }
+        monitor[0]->setTooltip ("Escuchar siempre la entrada"); monitor[1]->setTooltip ("Escuchar la entrada solo al armar"); monitor[2]->setTooltip ("No escuchar la entrada");
+        for (auto* c : { (Component*) &input, (Component*) &arm }) addAndMakeVisible (c);
+        refresh();
+    }
+
+    void refresh()
+    {
+        if (Session::returnBus (*track) >= 0) return;
+        auto ins = session.inputs();
+        auto cur = session.inputOf (*track);
+        input.clear (dontSendNotification);
+        input.addItem ("NO INPUT", 1);
+        for (int i = 0; i < ins.size(); ++i)
+            input.addItem ((Session::isMidiIn (ins[i]) ? "MIDI  " : "AUDIO  ") + ins[i]->getInputDevice().getName(), i + 2);
+        input.setSelectedId (cur ? ins.indexOf (cur) + 2 : 1, dontSendNotification);
+        arm.setToggleState (session.isArmed (*track), dontSendNotification);
+        int m = 2;
+        if (cur) { auto mm = cur->getInputDevice().getMonitorMode(); m = mm == te::InputDevice::MonitorMode::on ? 0 : mm == te::InputDevice::MonitorMode::automatic ? 1 : 2; }
+        monitor[m]->setToggleState (true, dontSendNotification);
+    }
+
+    void paint (Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat().reduced (4, 6);
+        sw::paintCard (g, r, 12.0f);
+        g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
+        auto out = outArea();
+        g.drawText ("OUT > MAIN", out, Justification::centredLeft);
+        g.setColour (sw::colour::text); g.setFont (sw::mono (10.0f));
+        g.drawText (String (volume.getValue(), 1) + " dB", out, Justification::centredRight);
+    }
+    Rectangle<int> outArea() const { return getLocalBounds().reduced (14, 10).removeFromBottom (14).withTrimmedLeft (getWidth() / 2); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (14, 10);
+        auto left = r.removeFromLeft (r.getWidth() / 2 - 4);
+        r.removeFromLeft (8);
+        if (! monitor.isEmpty())
+        {
+            input.setBounds (left.removeFromTop (22)); left.removeFromTop (5);
+            auto row = left.removeFromTop (20);
+            for (auto* b : monitor) { b->setBounds (row.removeFromLeft (row.getWidth() / jmax (1, monitor.size() - monitor.indexOf (b)))); }
+        }
+        auto top = r.removeFromTop (22); r.removeFromTop (5);
+        if (! monitor.isEmpty()) arm.setBounds (top.removeFromRight (30));
+        pan.setBounds (top.removeFromLeft (22).expanded (2));
+        volume.setBounds (r.removeFromTop (10).withTrimmedRight (2));
+    }
+
+    Session& session; te::AudioTrack::Ptr track;
+    ComboBox input; Pill arm { "o" };
+    OwnedArray<Pill> monitor;
+    Slider volume, pan;
+};
+
+//==============================================================================
 // TIMELINE: horizontal arrangement
 struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, ChangeListener
 {
@@ -684,16 +851,34 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     Timeline (Session& s) : session (s)
     {
         startTimerHz (30);
-        for (auto* b : { &zOut, &zIn, &hOut, &hIn }) addAndMakeVisible (b);
+        for (auto* b : { &zOut, &zIn, &hOut, &hIn, &ioToggle }) addAndMakeVisible (b);
+        ioToggle.setClickingTogglesState (true); ioToggle.setToggleState (true, dontSendNotification);
+        ioToggle.setTooltip ("Mostrar u ocultar entradas/salidas de cada pista");
+        ioToggle.onClick = [this] { rebuildIO(); };
         zIn.onClick  = [this] { pxPerSec = jmin (600.0, pxPerSec * 1.4); repaint(); };
         zOut.onClick = [this] { pxPerSec = jmax (4.0, pxPerSec / 1.4); repaint(); };
-        hIn.onClick  = [this] { rowH = jmin (220, rowH + 20); repaint(); };
-        hOut.onClick = [this] { rowH = jmax (44, rowH - 20); repaint(); };
+        hIn.onClick  = [this] { rowH = jmin (220, rowH + 20); resized(); repaint(); };
+        hOut.onClick = [this] { rowH = jmax (44, rowH - 20); resized(); repaint(); };
     }
     void changeListenerCallback (ChangeBroadcaster*) override { repaint(); }
+
+    static constexpr int ioW = 280;
+    void rebuildIO()
+    {
+        io.clear();
+        if (ioToggle.getToggleState())
+            for (auto t : tracks()) addAndMakeVisible (io.add (new IORow (session, *t)));
+        ioToggle.toFront (false);
+        resized(); repaint();
+    }
+
     void resized() override
     {
-        auto r = getLocalBounds().reduced (10).removeFromBottom (26).removeFromRight (4 * 40 + 30);
+        auto trs = tracks();
+        for (int i = 0; i < io.size() && i < trs.size(); ++i)
+            io[i]->setBounds (rowBounds (i).withLeft (getWidth() - ioW));
+        ioToggle.setBounds (getWidth() - 52, 2, 46, rulerH - 4);
+        auto r = getLocalBounds().reduced (10).removeFromBottom (26).withTrimmedRight (io.isEmpty() ? 0 : ioW).removeFromRight (4 * 40 + 30);
         for (auto* b : { &zOut, &zIn }) { b->setBounds (r.removeFromLeft (40)); r.removeFromLeft (4); }
         r.removeFromLeft (18);
         for (auto* b : { &hOut, &hIn }) { b->setBounds (r.removeFromLeft (40)); r.removeFromLeft (4); }
@@ -1011,7 +1196,8 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     enum { moveClip, trimLeft, trimRight } dragMode = moveClip;
     int dragTrack = -1, dropLine = -1;
     Waveforms waves;
-    Pill zOut { "-" }, zIn { "+" }, hOut { "H-" }, hIn { "H+" };
+    Pill zOut { "-" }, zIn { "+" }, hOut { "H-" }, hIn { "H+" }, ioToggle { "I/O" };
+    OwnedArray<IORow> io;
     int dropHighlight = -1;
 };
 
@@ -1298,6 +1484,11 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
 };
 
 //==============================================================================
+// Project key and scale (bit n = semitone n above the root)
+static const StringArray keyNames { "NO KEY", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+static const StringArray scaleNames { "MAJOR", "MINOR", "DORIAN", "HARM. MINOR", "PENT. MAJOR", "PENT. MINOR", "BLUES" };
+static int scaleMask (int i) { static const int m[] { 0b101010110101, 0b010110101101, 0b011010101101, 0b100110101101, 0b001010010101, 0b010010101001, 0b010011101001 }; return m[jlimit (0, 6, i)]; }
+
 // Grid values shared by the piano roll and the chopper (in beats)
 static const StringArray gridNames { "1/4", "1/8", "1/16", "1/32", "1/4 T", "1/8 T", "1/16 T", "1/32 T" };
 static double gridBeats (int i) { static const double v[] { 1, 0.5, 0.25, 0.125, 2.0/3, 1.0/3, 1.0/6, 1.0/12 }; return v[jlimit (0, 7, i)]; }
@@ -1365,7 +1556,9 @@ struct PianoRoll : Component
         {
             const bool black = MidiMessage::isMidiNoteBlack (n);
             auto row = Rectangle<float> ((float) r.getX(), yFor (n), (float) r.getWidth(), (float) rowH);
-            if (black) { g.setColour (sw::colour::subtle); g.fillRect (row); }
+            const int keyRoot = session.edit->state.getProperty ("swKey", -1);
+            const bool outOfKey = keyRoot >= 0 && ! (scaleMask (session.edit->state.getProperty ("swScale", 0)) & (1 << (((n - keyRoot) % 12 + 12) % 12)));
+            if (keyRoot >= 0 ? outOfKey : black) { g.setColour (sw::colour::subtle); g.fillRect (row); }
             g.setColour (black ? sw::colour::text : sw::colour::card);
             g.fillRect (Rectangle<float> (0, yFor (n), keysW - 4.0f, (float) rowH - 1));
             if (n % 12 == 0)
@@ -2035,106 +2228,365 @@ struct BpmBox : Component
 };
 
 //==============================================================================
-// TOP BAR
+// TOP BAR: views | tempo & timing | transport | loop | key | CPU | project
+// Pill button with a small dot-matrix glyph (5x5) before its label, in the same style as the logo
+struct DotButton : TextButton
+{
+    enum Glyph { none, play, stop, rec, loop, click, browser, panel, timeline, grid, plus, gear, exportUp };
+    DotButton (const String& label, Glyph g, const String& tip) : TextButton (label), glyph (g) { setTooltip (tip); setWantsKeyboardFocus (false); }
+
+    // 7x7 dot glyphs, row by row ('1' = dot)
+    static const char* rows (Glyph g)
+    {
+        switch (g)
+        {
+            case play     : return "1......111....11111..111111111111..111....1......";
+            case stop     : return "........11111..11111..11111..11111..11111........";
+            case rec      : return "..111...11111.111111111111111111111.11111...111..";
+            case loop     : return "..1.....1111111.1...11.....11...1.1111111.....1..";
+            case click    : return "...1......1.....1.1....1.1...1...1..1...1.1111111";
+            case browser  : return "111111111....111....111....111....111....11111111";
+            case panel    : return "11111111.....11.....11.....1111111111111111111111";
+            case timeline : return "1111............11111.......111..............1111";
+            case grid     : return "111.111111.111111.111.......111.111111.111111.111";
+            case plus     : return "...1......1......1...1111111...1......1......1...";
+            case gear     : return "1..1..1.11111..1...1.11...11.1...1..11111.1..1..1";
+            case exportUp : return "...1.....111...1.1.1....1......1...1.....11111111";
+            default:       return nullptr;
+        }
+    }
+
+    void paintButton (Graphics& g, bool over, bool down) override
+    {
+        getLookAndFeel().drawButtonBackground (g, *this, findColour (getToggleState() ? buttonOnColourId : buttonColourId), over, down);
+        const auto col = findColour (getToggleState() ? textColourOnId : textColourOffId);
+        const auto font = sw::label (jlimit (9.0f, 11.0f, getHeight() * 0.32f));
+        const float textW = (float) GlyphArrangement::getStringWidth (font, getButtonText());
+        const float dot = 2.0f, step = 2.6f, glyphW = rows (glyph) ? step * 7 + 6 : 0;
+        float x = getWidth() / 2.0f - (glyphW + textW) / 2;
+        if (auto* bits = rows (glyph))
+        {
+            const float y0 = getHeight() / 2.0f - step * 3.5f;
+            g.setColour (glyph == rec && ! getToggleState() ? sw::colour::accent : col);
+            for (int i = 0; i < 49 && bits[i]; ++i)
+                if (bits[i] == '1') g.fillEllipse (x + (i % 7) * step, y0 + (i / 7) * step, dot, dot);
+            x += glyphW;
+        }
+        g.setColour (col); g.setFont (font);
+        g.drawText (getButtonText(), Rectangle<float> (x, 0, textW + 2, (float) getHeight()), Justification::centredLeft);
+    }
+    Glyph glyph;
+};
+
+
 struct TopBar : Component, Timer
 {
     TopBar (Session& s) : session (s)
     {
-        for (auto* b : { &browser, &panel, &timeline, &grid, &play, &stop, &rec, &loop, &metro, &addTrack, &exportBtn, &settingsBtn })
+        for (auto* b : std::initializer_list<Component*> { &browser, &panel, &timeline, &grid, &tap, &bpm, &sig, &metro, &quant,
+                                                          &play, &stop, &rec, &loop, &loopLen, &key, &scale, &addTrack, &exportBtn, &settingsBtn })
             addAndMakeVisible (b);
-        for (auto* b : { &browser, &panel, &loop, &metro }) b->setClickingTogglesState (true);
-        panel.setToggleState (true, dontSendNotification);
+        for (auto* b : { &browser, &panel, &metro, &loop }) b->setClickingTogglesState (true);
+        rec.setColour (TextButton::buttonOnColourId, sw::colour::accent);
+        browser.setToggleState (true, dontSendNotification); panel.setToggleState (true, dontSendNotification);
         timeline.setRadioGroupId (1); grid.setRadioGroupId (1);
         timeline.setClickingTogglesState (true); grid.setClickingTogglesState (true);
         timeline.setToggleState (true, dontSendNotification);
-        browser.setToggleState (true, dontSendNotification);
-        rec.setColour (TextButton::buttonOnColourId, sw::colour::accent);
-        bpm.onChange = [this] (double v) { session.edit->tempoSequence.getTempos()[0]->setBpm (v); };
-        addAndMakeVisible (bpm);
 
-        auto& tc = session.edit->getTransport();
-        play.onClick = [&tc] { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); };
-        stop.onClick = [&tc] { tc.stop (false, false); tc.setPosition (te::TimePosition()); };
+        tap.onClick = [this] { tapTempo(); };
+        bpm.onChange = [this] (double v) { session.edit->tempoSequence.getTempos()[0]->setBpm (v); };
+        sig.addItemList ({ "2/4", "3/4", "4/4", "5/4", "6/8", "7/8", "12/8" }, 1); sig.setTooltip (String::fromUTF8 ("Compás"));
+        sig.onChange = [this] { session.edit->tempoSequence.getTimeSigs()[0]->setStringTimeSig (sig.getText()); };
+        quant.addItemList ({ "NONE", "1 BAR", "1/2", "1/4", "1/8", "1/16" }, 1); quant.setTooltip (String::fromUTF8 ("Cuantización al lanzar clips"));
+        quant.onChange = [this]
+        {
+            static const te::LaunchQType q[] { te::LaunchQType::none, te::LaunchQType::bar, te::LaunchQType::half,
+                                              te::LaunchQType::quarter, te::LaunchQType::eighth, te::LaunchQType::sixteenth };
+            session.edit->getLaunchQuantisation().type = q[jlimit (0, 5, quant.getSelectedItemIndex())];
+        };
+        loopLen.addItemList ({ "1 BAR", "2 BARS", "4 BARS", "8 BARS", "16 BARS" }, 1); loopLen.setTextWhenNothingSelected ("LOOP LEN"); loopLen.setTooltip (String::fromUTF8 ("Largo del loop, desde el compás del cursor"));
+        loopLen.onChange = [this] { setLoopFromPlayhead (std::array { 1, 2, 4, 8, 16 }[(size_t) loopLen.getSelectedItemIndex()]); };
+        key.addItemList (keyNames, 1); key.setTooltip ("Tonalidad del proyecto (marca la escala en el piano roll)");
+        scale.addItemList (scaleNames, 1); scale.setTooltip ("Escala");
+        key.onChange = scale.onChange = [this]
+        {
+            session.edit->state.setProperty ("swKey", key.getSelectedItemIndex() - 1, nullptr);
+            session.edit->state.setProperty ("swScale", scale.getSelectedItemIndex(), nullptr);
+            session.changed();
+        };
+
+        play.onClick = [this] { auto& tc = transport(); tc.isPlaying() ? tc.stop (false, false) : tc.play (false); };
+        stop.onClick = [this] { auto& tc = transport(); if (! tc.isPlaying()) tc.setPosition (te::TimePosition()); tc.stop (false, false); };
         rec.onClick  = [this] { session.toggleRecord(); };
-        loop.onClick = [this, &tc] { tc.looping = loop.getToggleState(); };
+        loop.onClick = [this] { transport().looping = loop.getToggleState(); };
         metro.onClick = [this] { session.edit->clickTrackEnabled = metro.getToggleState(); };
         addTrack.onClick = [this] { session.addTrack(); };
         exportBtn.onClick = [this] { openDialog ("Export", new ExportPanel (session)); };
         settingsBtn.onClick = [this] { openDialog ("Settings", new SettingsPanel (session)); };
+        syncFromEdit();
         startTimerHz (20);
+    }
+
+    te::TransportControl& transport() { return session.edit->getTransport(); }
+
+    // Fill the selectors from the current project (after opening one)
+    void syncFromEdit()
+    {
+        auto& ts = session.edit->tempoSequence;
+        auto* tsig = ts.getTimeSigs()[0];
+        sig.setText (String (tsig->numerator.get()) + "/" + String (tsig->denominator.get()), dontSendNotification);
+        key.setSelectedItemIndex ((int) session.edit->state.getProperty ("swKey", -1) + 1, dontSendNotification);
+        scale.setSelectedItemIndex ((int) session.edit->state.getProperty ("swScale", 0), dontSendNotification);
+        static const te::LaunchQType q[] { te::LaunchQType::none, te::LaunchQType::bar, te::LaunchQType::half,
+                                          te::LaunchQType::quarter, te::LaunchQType::eighth, te::LaunchQType::sixteenth };
+        int qi = 1; for (int i = 0; i < 6; ++i) if (session.edit->getLaunchQuantisation().type.get() == q[i]) qi = i;
+        quant.setSelectedItemIndex (qi, dontSendNotification);
+        metro.setToggleState (session.edit->clickTrackEnabled.get(), dontSendNotification);
+    }
+
+    void setLoopFromPlayhead (int bars)
+    {
+        auto& tc = transport(); auto& ts = session.edit->tempoSequence;
+        const int bar = ts.toBarsAndBeats (tc.getPosition()).bars;
+        tc.setLoopRange ({ ts.toTime (te::tempo::BarsAndBeats { .bars = bar }), ts.toTime (te::tempo::BarsAndBeats { .bars = bar + bars }) });
+        tc.looping = true;
+    }
+
+    void tapTempo()
+    {
+        const double now = Time::getMillisecondCounterHiRes();
+        if (taps.isEmpty() || now - taps.getLast() > 2000) taps.clear();
+        taps.add (now);
+        if (taps.size() > 5) taps.remove (0);
+        if (taps.size() >= 2)
+            bpm.set (60000.0 * (taps.size() - 1) / (taps.getLast() - taps.getFirst()));
     }
 
     void timerCallback() override
     {
-        auto& tc = session.edit->getTransport();
+        auto& tc = transport();
         play.setToggleState (tc.isPlaying(), dontSendNotification);
         rec.setToggleState (tc.isRecording(), dontSendNotification);
         loop.setToggleState (tc.looping.get(), dontSendNotification);
-        if (! bpm.isMouseButtonDown()) bpm.setValue (session.edit->tempoSequence.getTempos()[0]->getBpm());
-        auto bb = session.edit->tempoSequence.toBarsAndBeats (tc.getPosition());
-        auto pos = String (bb.bars + 1) + "." + String (bb.getWholeBeats() + 1) + "."
-                 + String ((int) (bb.getFractionalBeats().inBeats() * 4) + 1);
-        if (pos != position) { position = pos; repaint(); }
+        if (! bpm.isMouseButtonDown() && ! bpm.editor.isVisible()) bpm.setValue (session.edit->tempoSequence.getTempos()[0]->getBpm());
+        auto& ts = session.edit->tempoSequence;
+        auto bb = ts.toBarsAndBeats (tc.getPosition());
+        auto pos = String (bb.bars + 1) + "." + String (bb.getWholeBeats() + 1) + "." + String ((int) (bb.getFractionalBeats().inBeats() * 4) + 1);
+        auto lr = tc.getLoopRange();
+        auto lp = String (ts.toBarsAndBeats (lr.getStart()).bars + 1) + " > " + String (ts.toBarsAndBeats (lr.getEnd()).bars + 1);
+        auto cp = "CPU " + String (roundToInt (session.engine.getDeviceManager().getCpuUsage() * 100)) + "%";
+        if (pos != position || lp != loopText || cp != cpu) { position = pos; loopText = lp; cpu = cp; repaint(); }
     }
 
     void paint (Graphics& g) override
     {
         g.setColour (sw::colour::card); g.fillRect (getLocalBounds());
         g.setColour (sw::colour::line); g.drawHorizontalLine (getHeight() - 1, 0, (float) getWidth());
-        g.setColour (sw::colour::text); g.setFont (sw::display (22.0f));
-        g.drawText ("SOUNDWAVE", 16, 0, 160, getHeight(), Justification::centredLeft);
-        g.setFont (sw::display (24.0f));
+        g.drawHorizontalLine (rowH, 0, (float) getWidth());
+        for (auto x : dividers) g.drawVerticalLine (x, rowH + 12.0f, getHeight() - 12.0f);
+        g.setColour (sw::colour::text); g.setFont (sw::display (20.0f));
+        g.drawText ("SOUNDWAVE", 14, rowH, 130, getHeight() - rowH, Justification::centredLeft);
+        g.setFont (sw::display (22.0f));
         g.drawText (position, positionArea, Justification::centred);
+        g.setColour (sw::colour::text2); g.setFont (sw::mono (10.0f));
+        g.drawText (loopText, loopArea, Justification::centredLeft);
+        g.drawText (cpu, cpuArea, Justification::centredRight);
     }
 
+    static constexpr int rowH = 36;   // row 1: menus (placed by MainComponent) + views/project buttons on the right
     void resized() override
     {
-        auto r = getLocalBounds().reduced (10, 10);
-        r.removeFromLeft (170);
-        browser.setBounds (r.removeFromLeft (80)); r.removeFromLeft (4);
-        panel.setBounds (r.removeFromLeft (64)); r.removeFromLeft (12);
-        timeline.setBounds (r.removeFromLeft (86)); r.removeFromLeft (2);
-        grid.setBounds (r.removeFromLeft (60)); r.removeFromLeft (20);
-        bpm.setBounds (r.removeFromLeft (130)); r.removeFromLeft (8);
-        metro.setBounds (r.removeFromLeft (64)); r.removeFromLeft (20);
-        for (auto* b : { &play, &stop, &rec, &loop }) { b->setBounds (r.removeFromLeft (58)); r.removeFromLeft (4); }
-        r.removeFromLeft (8);
-        positionArea = r.removeFromLeft (120);
-        settingsBtn.setBounds (r.removeFromRight (90)); r.removeFromRight (6);
-        exportBtn.setBounds (r.removeFromRight (80)); r.removeFromRight (6);
-        addTrack.setBounds (r.removeFromRight (90));
+        dividers.clear();
+        auto top = getLocalBounds().removeFromTop (rowH).reduced (10, 5);
+        for (auto* b : { &settingsBtn, &exportBtn, &addTrack }) { b->setBounds (top.removeFromRight (b == &settingsBtn ? 104 : 88)); top.removeFromRight (4); }
+        top.removeFromRight (14);
+        for (auto* b : { &grid, &timeline }) { b->setBounds (top.removeFromRight (b == &grid ? 70 : 96)); top.removeFromRight (3); }
+        top.removeFromRight (10);
+        for (auto* b : { &panel, &browser }) { b->setBounds (top.removeFromRight (b == &panel ? 78 : 96)); top.removeFromRight (3); }
+
+        auto r = getLocalBounds().withTrimmedTop (rowH).reduced (10, 9);
+        auto gap = [&] (int w) { r.removeFromLeft (w); };
+        auto div = [&] { gap (8); dividers.add (r.getX()); gap (8); };
+        r.removeFromLeft (140);
+        tap.setBounds (r.removeFromLeft (52)); gap (4);
+        bpm.setBounds (r.removeFromLeft (110)); gap (4);
+        sig.setBounds (r.removeFromLeft (78)); gap (4);
+        metro.setBounds (r.removeFromLeft (84)); gap (4);
+        quant.setBounds (r.removeFromLeft (84));
+        div();
+        for (auto* b : { &play, &stop, &rec }) { b->setBounds (r.removeFromLeft (b == &rec ? 70 : 76)); gap (4); }
+        positionArea = r.removeFromLeft (100);
+        div();
+        loop.setBounds (r.removeFromLeft (78)); gap (4);
+        loopLen.setBounds (r.removeFromLeft (96)); gap (4);
+        loopArea = r.removeFromLeft (44);
+        cpuArea = r.removeFromRight (52); r.removeFromRight (8);
+        scale.setBounds (r.removeFromRight (110)); r.removeFromRight (4);
+        key.setBounds (r.removeFromRight (96));
     }
 
     Session& session;
-    Pill panel { "PANEL" };
-    Pill browser { "BROWSER" }, timeline { "TIMELINE" }, grid { "GRID" }, play { "PLAY" }, stop { "STOP" },
-         rec { "REC" }, loop { "LOOP" }, metro { "CLICK" }, addTrack { "+ TRACK" }, exportBtn { "EXPORT" }, settingsBtn { "SETTINGS" };
+    DotButton browser { "BROWSER", DotButton::browser, "Navegador (Ctrl+Alt+B)" }, panel { "PANEL", DotButton::panel, "Panel inferior (Ctrl+Alt+L)" },
+              timeline { "TIMELINE", DotButton::timeline, "Vista TIMELINE (Tab)" }, grid { "GRID", DotButton::grid, "Vista GRID (Tab)" },
+              metro { "CLICK", DotButton::click, String::fromUTF8 ("Metr\xc3\xb3nomo") }, play { "PLAY", DotButton::play, "Play / pausa (Espacio)" },
+              stop { "STOP", DotButton::stop, "Stop (dos veces: volver al inicio)" },
+              rec { "REC", DotButton::rec, "Grabar (R): si no hay ninguna pista armada, arma la seleccionada" },
+              loop { "LOOP", DotButton::loop, "Loop (Ctrl+L)" }, addTrack { "TRACK", DotButton::plus, "Nueva pista (Ctrl+T)" },
+              settingsBtn { "SETTINGS", DotButton::gear, "Ajustes: audio, MIDI y plugins" },
+              exportBtn { "EXPORT", DotButton::exportUp, "Exportar WAV / MP3 (Ctrl+Shift+R)" },
+              tap { "TAP", DotButton::none, "Pulsa al ritmo para fijar el tempo" };
     BpmBox bpm;
-    String position { "1.1.1" };
-    Rectangle<int> positionArea;
+    ComboBox sig, quant, loopLen, key, scale;
+    Array<double> taps;
+    Array<int> dividers;
+    String position { "1.1.1" }, loopText, cpu;
+    Rectangle<int> positionArea, loopArea, cpuArea;
 };
 
 //==============================================================================
-struct MainComponent : Component, DragAndDropContainer
+struct AppLook : sw::LookAndFeel
+{
+    Font getMenuBarFont (MenuBarComponent&, int, const String&) override { return sw::label (11.0f); }
+    void drawMenuBarBackground (Graphics& g, int, int, bool, MenuBarComponent&) override { g.fillAll (sw::colour::card); }
+    void drawMenuBarItem (Graphics& g, int w, int h, int, const String& text, bool over, bool open, bool, MenuBarComponent& bar) override
+    {
+        if (over || open) { g.setColour (sw::colour::text); g.fillRoundedRectangle (Rectangle<float> (0, 5, (float) w, (float) h - 10), (h - 10) / 2.0f); }
+        g.setColour (over || open ? sw::colour::card : sw::colour::text);
+        g.setFont (getMenuBarFont (bar, 0, text));
+        g.drawText (text, 0, 0, w, h, Justification::centred);
+    }
+    int getMenuBarItemWidth (MenuBarComponent& bar, int i, const String& text) override
+    { return GlyphArrangement::getStringWidthInt (getMenuBarFont (bar, i, text), text) + 26; }
+};
+
+struct MainComponent : Component, DragAndDropContainer, MenuBarModel
 {
     MainComponent()
     {
         LookAndFeel::setDefaultLookAndFeel (&laf);
+        addAndMakeVisible (menu);
         addAndMakeVisible (top); addAndMakeVisible (browser);
         addAndMakeVisible (timeline); addChildComponent (grid); addAndMakeVisible (detail);
         top.timeline.onClick = [this] { showGrid (false); };
         top.grid.onClick = [this] { showGrid (true); };
         top.browser.onClick = [this] { browser.setVisible (top.browser.getToggleState()); resized(); };
         top.panel.onClick = [this] { detail.setVisible (top.panel.getToggleState()); resized(); };
-        session.onChange = [this] { grid.rebuild(); timeline.repaint(); detail.refresh(); };
+        session.onChange = [this] { grid.rebuild(); timeline.rebuildIO(); detail.refresh(); };
         session.onSelect = [this] { detail.refresh(); timeline.repaint(); };
         session.onPluginsScanned = [this] { browser.refreshPlugins(); };
         browser.refreshPlugins();
         session.scanPluginsInBackground();
+        timeline.rebuildIO();
         setWantsKeyboardFocus (true);
         setSize (1440, 860);
     }
     ~MainComponent() override { session.save(); LookAndFeel::setDefaultLookAndFeel (nullptr); }
+
+    // ---- menu bar (ARCHIVO, EDICIÓN, ...), same actions as the buttons and shortcuts
+    StringArray getMenuBarNames() override
+    {
+        StringArray names;
+        for (auto* n : { "ARCHIVO", "EDICI\xc3\x93N", "CREAR", "REPRODUCCI\xc3\x93N", "VER", "AYUDA" }) names.add (String::fromUTF8 (n));
+        return names;
+    }
+    PopupMenu getMenuForIndex (int i, const String&) override
+    {
+        PopupMenu m;
+        auto item = [&] (int id, const String& name, const String& keys) { PopupMenu::Item it (name); it.setID (id); it.shortcutKeyDescription = keys; m.addItem (it); };
+        switch (i)
+        {
+            case 0: item (1, "Nuevo proyecto", "Ctrl+N"); item (2, "Abrir...", "Ctrl+O"); item (3, "Guardar", "Ctrl+S");
+                    item (4, "Guardar como...", "Ctrl+Shift+S"); m.addSeparator(); item (5, "Exportar audio...", "Ctrl+Shift+R");
+                    item (6, "Ajustes...", "Ctrl+,"); m.addSeparator(); item (7, "Salir", "Alt+F4"); break;
+            case 1: item (10, "Deshacer", "Ctrl+Z"); item (11, "Rehacer", "Ctrl+Y"); m.addSeparator();
+                    item (12, "Cortar clip en el cursor", "Ctrl+E"); item (13, "Duplicar clip", "Ctrl+D"); item (14, "Borrar clip", "Supr"); break;
+            case 2: item (20, "Pista", "Ctrl+T"); item (21, "Clip MIDI en el cursor", "Ctrl+Shift+M"); break;
+            case 3: item (30, "Play / pausa", "Espacio"); item (31, "Grabar", "R"); item (32, "Loop", "Ctrl+L");
+                    item (33, String::fromUTF8 ("Metrónomo"), ""); item (34, "Volver al inicio", "Inicio"); break;
+            case 4: item (40, "Navegador", "Ctrl+Alt+B"); item (41, "Panel inferior", "Ctrl+Alt+L"); item (42, "TIMELINE / GRID", "Tab");
+                    item (43, "Entradas/salidas (I/O)", ""); break;
+            case 5: item (50, "Atajos de teclado", ""); item (51, "Acerca de SoundWave", ""); break;
+            default: break;
+        }
+        return m;
+    }
+    void menuItemSelected (int id, int) override
+    {
+        auto& tc = session.edit->getTransport();
+        switch (id)
+        {
+            case 1: chooseFile (true, true); break;
+            case 2: chooseFile (false, false); break;
+            case 3: session.save(); break;
+            case 4: chooseFile (true, false); break;
+            case 5: top.exportBtn.triggerClick(); break;
+            case 6: top.settingsBtn.triggerClick(); break;
+            case 7: JUCEApplication::getInstance()->systemRequestedQuit(); break;
+            case 10: session.edit->getUndoManager().undo(); break;
+            case 11: session.edit->getUndoManager().redo(); break;
+            case 12: splitAtPlayhead(); break;
+            case 13: session.duplicateSelected(); break;
+            case 14: deleteSelected(); break;
+            case 20: session.addTrack(); break;
+            case 21: midiClipAtPlayhead(); break;
+            case 30: tc.isPlaying() ? tc.stop (false, false) : tc.play (false); break;
+            case 31: top.rec.triggerClick(); break;
+            case 32: top.loop.triggerClick(); break;
+            case 33: top.metro.triggerClick(); break;
+            case 34: tc.setPosition (te::TimePosition()); break;
+            case 40: top.browser.triggerClick(); break;
+            case 41: top.panel.triggerClick(); break;
+            case 42: showGrid (! grid.isVisible()); break;
+            case 43: timeline.ioToggle.triggerClick(); break;
+            case 50: AlertWindow::showMessageBoxAsync (MessageBoxIconType::NoIcon, "ATAJOS",
+                        String::fromUTF8 ("Espacio  play / pausa\nR  grabar\nTab  TIMELINE / GRID\nCtrl+T  nueva pista\nCtrl+E  cortar clip en el cursor\n"
+                        "Ctrl+D  duplicar clip\nSupr  borrar clip\nCtrl+L  loop\nCtrl+Z / Ctrl+Y  deshacer / rehacer\nCtrl+S  guardar\n"
+                        "Ctrl+Alt+B  navegador\nCtrl+Alt+L  panel inferior\nCtrl + rueda  zoom horizontal\nAlt + rueda  altura de pistas\n"
+                        "Alt al arrastrar  mover sin ajustar a la rejilla\nDoble clic en una pista vacía  clip MIDI")); break;
+            case 51: AlertWindow::showMessageBoxAsync (MessageBoxIconType::NoIcon, "SOUNDWAVE",
+                        "SoundWave " + JUCEApplication::getInstance()->getApplicationVersion() + String::fromUTF8 ("\nCódigo abierto (GPLv3).\n"
+                        "Motor: Tracktion Engine. Interfaz: JUCE. MP3: LAME.")); break;
+            default: break;
+        }
+    }
+
+    void chooseFile (bool save, bool isNew)
+    {
+        chooser = std::make_unique<FileChooser> (isNew ? "Nuevo proyecto" : save ? "Guardar como" : "Abrir proyecto",
+                                                 session.editFile.getParentDirectory(), "*.tracktionedit");
+        auto flags = save ? FileBrowserComponent::saveMode | FileBrowserComponent::warnAboutOverwriting : FileBrowserComponent::openMode;
+        chooser->launchAsync (flags | FileBrowserComponent::canSelectFiles, [this, save, isNew] (const FileChooser& fc)
+        {
+            auto f = fc.getResult();
+            if (f == File()) return;
+            f = f.withFileExtension ("tracktionedit");
+            timeline.selected = nullptr;
+            if (isNew) { f.deleteFile(); session.open (f); }
+            else if (save) session.saveAs (f);
+            else session.open (f);
+            top.syncFromEdit();
+            getTopLevelComponent()->setName ("SoundWave - " + session.editFile.getFileNameWithoutExtension());
+        });
+    }
+
+    void splitAtPlayhead()
+    {
+        if (! Session::alive (session.selClip.get())) return;
+        if (auto ct = dynamic_cast<te::ClipTrack*> (session.selClip->getTrack()))
+            if (auto right = ct->splitClip (*session.selClip, session.edit->getTransport().getPosition()))
+            { session.select (session.selTrack.get(), right); session.changed(); }
+    }
+    void deleteSelected()
+    {
+        if (! Session::alive (session.selClip.get())) return;
+        session.selClip->removeFromParent(); timeline.selected = nullptr;
+        session.select (session.selTrack.get(), nullptr); session.changed();
+    }
+    void midiClipAtPlayhead()
+    {
+        auto t = session.selTrack ? session.selTrack.get() : session.regularTracks().getFirst();
+        if (t) session.addMidiClip (*t, session.edit->tempoSequence.toBarsAndBeats (session.edit->getTransport().getPosition()).bars);
+    }
 
     void showGrid (bool g)
     {
@@ -2152,6 +2604,13 @@ struct MainComponent : Component, DragAndDropContainer
         if (k == KeyPress::spaceKey) { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); return true; }
         if (k.getTextCharacter() == 'r' && ! c) { top.rec.triggerClick(); return true; }
         if (c && k.getKeyCode() == 'T') { session.addTrack(); return true; }
+        if (c && k.getKeyCode() == 'N') { menuItemSelected (1, 0); return true; }
+        if (c && k.getKeyCode() == 'O') { menuItemSelected (2, 0); return true; }
+        if (c && k.getModifiers().isShiftDown() && k.getKeyCode() == 'S') { menuItemSelected (4, 0); return true; }
+        if (c && k.getModifiers().isShiftDown() && k.getKeyCode() == 'R') { menuItemSelected (5, 0); return true; }
+        if (c && k.getModifiers().isShiftDown() && k.getKeyCode() == 'M') { midiClipAtPlayhead(); return true; }
+        if (c && k.getKeyCode() == 'D') { session.duplicateSelected(); return true; }
+        if (k == KeyPress::homeKey) { tc.setPosition (te::TimePosition()); return true; }
         if (c && k.getKeyCode() == 'S') { session.save(); return true; }
         if (c && k.getKeyCode() == 'L') { top.loop.triggerClick(); return true; }
         if (c && k.getKeyCode() == 'E' && Session::alive (session.selClip.get()))   // split at the playhead
@@ -2164,21 +2623,25 @@ struct MainComponent : Component, DragAndDropContainer
         if (c && k.getKeyCode() == 'Y') { session.edit->getUndoManager().redo(); return true; }
         if (c && k.getModifiers().isAltDown() && k.getKeyCode() == 'B') { top.browser.triggerClick(); return true; }
         if (c && k.getModifiers().isAltDown() && k.getKeyCode() == 'L') { top.panel.triggerClick(); return true; }
-        if ((k == KeyPress::deleteKey || k == KeyPress::backspaceKey) && timeline.selected)
-        { timeline.selected->removeFromParent(); timeline.selected = nullptr; session.changed(); return true; }
+        if (k == KeyPress::deleteKey || k == KeyPress::backspaceKey) { deleteSelected(); return true; }
         return false;
     }
 
     void resized() override
     {
         auto r = getLocalBounds();
-        top.setBounds (r.removeFromTop (52));
+        top.setBounds (r.removeFromTop (TopBar::rowH + 52));
+        menu.setBounds (0, 0, 560, TopBar::rowH);
+        menu.toFront (false);
         if (browser.isVisible()) browser.setBounds (r.removeFromLeft (290));
         if (detail.isVisible()) detail.setBounds (r.removeFromBottom (jmin (330, r.getHeight() / 2)));
         timeline.setBounds (r); grid.setBounds (r);
     }
 
-    sw::LookAndFeel laf;
+    AppLook laf;
+    MenuBarComponent menu { this };
+    TooltipWindow tips { this, 600 };
+    std::unique_ptr<FileChooser> chooser;
     Session session;
     Previewer previewer { session.engine.getDeviceManager().deviceManager };
     TopBar top { session };
