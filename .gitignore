@@ -1,0 +1,6 @@
+build/
+build-ui/
+app/build/
+shots/all/
+*.user
+.DS_Store

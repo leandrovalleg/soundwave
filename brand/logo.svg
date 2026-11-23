@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" stroke="#111" stroke-linecap="round">
+  <circle cx="256" cy="256" r="200" stroke-width="28"/>
+  <!-- bars whose heights trace an S-shaped wave -->
+  <g stroke-width="22">
+    <line x1="136" y1="236" x2="136" y2="276"/>
+    <line x1="176" y1="186" x2="176" y2="326"/>
+    <line x1="216" y1="146" x2="216" y2="300"/>
+    <line x1="256" y1="196" x2="256" y2="316"/>
+    <line x1="296" y1="212" x2="296" y2="366"/>
+    <line x1="336" y1="186" x2="336" y2="326"/>
+    <line x1="376" y1="236" x2="376" y2="276"/>
+  </g>
+</svg>

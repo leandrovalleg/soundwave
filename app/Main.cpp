@@ -1,0 +1,1095 @@
+// SoundWave — DAW app (v0.1). GPLv3.
+// Engine: Tracktion Engine. Look: plugins/SWDesign.h (shared with the SoundWave plugins).
+#include <tracktion_engine/tracktion_engine.h>
+namespace te = tracktion;
+using namespace juce;
+using namespace tracktion::literals;
+#include "../tracktion_engine/examples/common/PluginWindow.h"   // Tracktion example helper: hosts plugin editors in windows
+#include "SWDesign.h"
+
+static constexpr int NumScenes = 8;
+
+//==============================================================================
+// App settings (library folders, plugin scan paths, window state)
+static PropertiesFile& settings()
+{
+    static PropertiesFile p ([] {
+        PropertiesFile::Options o;
+        o.applicationName = "SoundWave"; o.filenameSuffix = "settings";
+        o.osxLibrarySubFolder = "Application Support";
+       #if JUCE_LINUX
+        o.folderName = ".config/SoundWave";   // JUCE puts it straight in ~ otherwise
+       #else
+        o.folderName = "SoundWave";
+       #endif
+        return o; }());
+    return p;
+}
+
+//==============================================================================
+// Clip launching (quantised to the edit's launch quantisation)
+namespace launch
+{
+    static te::MonotonicBeat position (te::Edit& e)
+    {
+        auto epc = e.getTransport().getCurrentPlaybackContext();
+        if (! epc) return {};
+        auto sp = epc->getSyncPoint();
+        if (! sp) return {};
+        auto next = e.getLaunchQuantisation().getNext (sp->beat);
+        return { sp->monotonicBeat.v + (next - sp->beat) };
+    }
+
+    static void ensurePlaying (te::Edit& e)
+    {
+        auto& tc = e.getTransport();
+        if (tc.isPlaying()) return;
+        if (auto epc = tc.getCurrentPlaybackContext()) epc->blockUntilSyncPointChange();
+        tc.play (false);
+    }
+
+    static void stopTrack (te::AudioTrack& t, te::Clip* except = nullptr)
+    {
+        auto& e = t.edit;
+        for (auto s : t.getClipSlotList().getClipSlots())
+            if (auto c = s->getClip(); c && c != except)
+                if (auto lh = c->getLaunchHandle())
+                    lh->stop (e.getTransport().isPlaying() ? std::optional (position (e)) : std::nullopt);
+    }
+
+    static bool isPlaying (te::Clip& c)
+    {
+        if (auto lh = c.getLaunchHandle())
+            return lh->getPlayingStatus() == te::LaunchHandle::PlayState::playing
+                || lh->getQueuedStatus() == te::LaunchHandle::QueueState::playQueued;
+        return false;
+    }
+
+    static void toggle (te::Clip& c)
+    {
+        auto lh = c.getLaunchHandle();
+        if (! lh) return;
+        if (isPlaying (c)) { lh->stop (position (c.edit)); return; }
+        if (auto t = dynamic_cast<te::AudioTrack*> (c.getTrack())) stopTrack (*t, &c);
+        ensurePlaying (c.edit);
+        lh->play (position (c.edit));
+    }
+
+    static void scene (te::Edit& e, int index)
+    {
+        ensurePlaying (e);
+        for (auto t : te::getAudioTracks (e))
+        {
+            auto slots = t->getClipSlotList().getClipSlots();
+            auto c = index < slots.size() ? slots[index]->getClip() : nullptr;
+            stopTrack (*t, c);
+            if (c && ! isPlaying (*c)) if (auto lh = c->getLaunchHandle()) lh->play (position (e));
+        }
+    }
+}
+
+//==============================================================================
+// Shared state
+struct Session
+{
+    te::Engine engine { "SoundWave", std::make_unique<ExtendedUIBehaviour>(), nullptr };
+    std::unique_ptr<te::Edit> edit;
+    File editFile = File::getSpecialLocation (File::userDocumentsDirectory).getChildFile ("SoundWave/Untitled.tracktionedit");
+    std::function<void()> onChange;   // structure changed (tracks/clips/plugins)
+
+    Session()
+    {
+        editFile.getParentDirectory().createDirectory();
+        edit = editFile.existsAsFile() ? te::loadEditFromFile (engine, editFile)
+                                       : te::createEmptyEdit (engine, editFile);
+        edit->ensureNumberOfAudioTracks (4);
+        prepareSlots();
+        edit->getTransport().ensureContextAllocated();
+    }
+
+    void prepareSlots()
+    {
+        edit->getSceneList().ensureNumberOfScenes (NumScenes);
+        for (auto t : te::getAudioTracks (*edit)) t->getClipSlotList().ensureNumberOfSlots (NumScenes);
+    }
+
+    void save() { te::EditFileOperations (*edit).save (false, true, false); }
+    void changed() { if (onChange) onChange(); }
+
+    te::AudioTrack* addTrack()
+    {
+        edit->ensureNumberOfAudioTracks (te::getAudioTracks (*edit).size() + 1);
+        prepareSlots(); changed();
+        return te::getAudioTracks (*edit).getLast();
+    }
+
+    static void loopWholeClip (te::Clip& c)
+    {
+        if (auto wc = dynamic_cast<te::WaveAudioClip*> (&c))
+        {
+            wc->setAutoTempo (true);
+            wc->setLoopRangeBeats ({ 0_bp, wc->getLengthInBeats() });
+        }
+    }
+
+    te::Clip* addAudioFile (te::ClipOwner& owner, const File& f, te::TimePosition start, bool forLauncher)
+    {
+        const double len = te::AudioFile (engine, f).getLength();
+        if (len <= 0) return nullptr;
+        auto c = te::insertWaveClip (owner, f.getFileNameWithoutExtension(), f,
+                                     { { start, te::TimeDuration::fromSeconds (len) }, {} },
+                                     forLauncher ? te::DeleteExistingClips::yes : te::DeleteExistingClips::no);
+        if (c && forLauncher) loopWholeClip (*c);
+        changed();
+        return c.get();
+    }
+
+    // Pop up a menu of every scanned plugin, insert the choice before the track's volume plugin.
+    void choosePluginFor (te::AudioTrack& t)
+    {
+        auto types = engine.getPluginManager().knownPluginList.getTypes();
+        PopupMenu m;
+        if (types.isEmpty()) m.addItem (-1, "No plugins yet - open SETTINGS > PLUGINS and scan", false);
+        KnownPluginList::addToMenu (m, types, KnownPluginList::sortByManufacturer);
+        m.showMenuAsync ({}, [this, types, tr = te::AudioTrack::Ptr (&t)] (int r)
+        {
+            const int idx = KnownPluginList::getIndexChosenByMenu (types, r);
+            if (idx < 0) return;
+            if (auto p = edit->getPluginCache().createNewPlugin (te::ExternalPlugin::xmlTypeName, types[idx]))
+            {
+                tr->pluginList.insertPlugin (p, jmax (0, tr->pluginList.indexOf (tr->getVolumePlugin())), nullptr);
+                p->showWindowExplicitly();
+                changed();
+            }
+        });
+    }
+
+    static Array<te::Plugin*> userPlugins (te::AudioTrack& t)
+    {
+        Array<te::Plugin*> out;
+        for (auto p : t.pluginList)
+            if (dynamic_cast<te::ExternalPlugin*> (p)) out.add (p);
+        return out;
+    }
+};
+
+//==============================================================================
+// Sample preview, mixed straight into the audio device next to the engine.
+struct Previewer
+{
+    explicit Previewer (AudioDeviceManager& dm) : dm (dm)
+    {
+        formats.registerBasicFormats();
+        player.setSource (&transport);
+        dm.addAudioCallback (&player);
+    }
+    ~Previewer() { dm.removeAudioCallback (&player); transport.setSource (nullptr); player.setSource (nullptr); }
+
+    void play (const File& f)
+    {
+        transport.stop(); transport.setSource (nullptr); source.reset();
+        if (auto* r = formats.createReaderFor (f))
+        {
+            source = std::make_unique<AudioFormatReaderSource> (r, true);
+            transport.setSource (source.get(), 0, nullptr, r->sampleRate);
+            transport.setGain (0.7f);
+            transport.start();
+        }
+    }
+    void stop() { transport.stop(); }
+
+    AudioDeviceManager& dm;
+    AudioFormatManager formats;
+    AudioTransportSource transport;
+    std::unique_ptr<AudioFormatReaderSource> source;
+    AudioSourcePlayer player;
+};
+
+static File draggedFile;   // ponytail: single global for the browser->track drag, fine with one browser
+
+static bool isAudioFile (const File& f)
+{
+    return f.hasFileExtension ("wav;aif;aiff;flac;mp3;ogg");
+}
+
+//==============================================================================
+// Small helpers for the look
+static void paintBackground (Graphics& g, Rectangle<int> r) { g.setColour (sw::colour::bg); g.fillRect (r); sw::paintDotGrid (g, r); }
+
+struct Pill : TextButton
+{
+    Pill (const String& t) : TextButton (t) { setWantsKeyboardFocus (false); }
+};
+
+//==============================================================================
+// BROWSER: your library folders, sample preview, drag onto TIMELINE or GRID
+struct Browser : Component, FileBrowserListener, DragAndDropContainer
+{
+    Browser (Previewer& pv) : preview (pv)
+    {
+        for (auto* b : { &add, &remove, &previewToggle }) addAndMakeVisible (b);
+        addAndMakeVisible (folders);
+        folders.onChange = [this] { showFolder (folders.getText()); };
+        add.onClick = [this] { addFolder(); };
+        remove.onClick = [this] { removeFolder(); };
+        previewToggle.setClickingTogglesState (true);
+        previewToggle.setToggleState (true, dontSendNotification);
+        thread.startThread();
+        tree.addListener (this);
+        tree.setDragAndDropDescription ("swfile");
+        tree.setColour (FileTreeComponent::backgroundColourId, sw::colour::card);
+        tree.setColour (TreeView::backgroundColourId, sw::colour::card);
+        addAndMakeVisible (tree);
+        reloadFolders();
+    }
+    ~Browser() override { tree.removeListener (this); }
+
+    StringArray savedFolders() const
+    {
+        StringArray s; s.addLines (settings().getValue ("libraryFolders")); s.removeEmptyStrings(); return s;
+    }
+    void saveFolders (const StringArray& s) { settings().setValue ("libraryFolders", s.joinIntoString ("\n")); settings().saveIfNeeded(); }
+
+    void reloadFolders()
+    {
+        auto s = savedFolders();
+        folders.clear (dontSendNotification);
+        folders.addItemList (s, 1);
+        if (s.size()) folders.setSelectedItemIndex (0);
+        else showFolder ({});
+    }
+
+    void addFolder()
+    {
+        chooser = std::make_unique<FileChooser> ("Add a library folder", File::getSpecialLocation (File::userMusicDirectory));
+        chooser->launchAsync (FileBrowserComponent::openMode | FileBrowserComponent::canSelectDirectories, [this] (const FileChooser& fc)
+        {
+            auto f = fc.getResult();
+            if (! f.isDirectory()) return;
+            auto s = savedFolders(); s.addIfNotAlreadyThere (f.getFullPathName()); saveFolders (s);
+            reloadFolders(); folders.setText (f.getFullPathName());
+        });
+    }
+
+    void removeFolder()
+    {
+        auto s = savedFolders(); s.removeString (folders.getText()); saveFolders (s); reloadFolders();
+    }
+
+    void showFolder (const String& path)
+    {
+        list.setDirectory (File (path), true, true);
+    }
+
+    void selectionChanged() override
+    {
+        auto f = tree.getSelectedFile();
+        if (isAudioFile (f)) { draggedFile = f; if (previewToggle.getToggleState()) preview.play (f); }
+    }
+    void fileClicked (const File&, const MouseEvent&) override {}
+    void fileDoubleClicked (const File&) override {}
+    void browserRootChanged (const File&) override {}
+
+    void paint (Graphics& g) override
+    {
+        paintBackground (g, getLocalBounds());
+        auto r = getLocalBounds().reduced (sw::space::m).toFloat();
+        sw::paintCard (g, r);
+        g.setColour (sw::colour::text); g.setFont (sw::display (20.0f));
+        g.drawText ("LIBRARY", r.reduced (16, 12).removeFromTop (24), Justification::centredLeft);
+        sw::paintCaption (g, "PLACES", getLocalBounds().reduced (28).withTrimmedTop (34).removeFromTop (14));
+        if (savedFolders().isEmpty())
+            sw::paintCaption (g, "ADD A FOLDER WITH YOUR SAMPLES", tree.getBounds().withHeight (30), Justification::centred);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (sw::space::m).reduced (16, 12);
+        r.removeFromTop (24 + 30);
+        auto row = r.removeFromTop (28);
+        remove.setBounds (row.removeFromRight (28)); row.removeFromRight (4);
+        add.setBounds (row.removeFromRight (28)); row.removeFromRight (6);
+        folders.setBounds (row);
+        r.removeFromTop (8);
+        previewToggle.setBounds (r.removeFromBottom (26).removeFromLeft (110));
+        r.removeFromBottom (8);
+        tree.setBounds (r);
+    }
+
+    Previewer& preview;
+    ComboBox folders;
+    Pill add { "+" }, remove { "-" }, previewToggle { "PREVIEW" };
+    TimeSliceThread thread { "SW file scan" };
+    WildcardFileFilter filter { "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg", "*", "Audio" };
+    DirectoryContentsList list { &filter, thread };
+    FileTreeComponent tree { list };
+    std::unique_ptr<FileChooser> chooser;
+};
+
+//==============================================================================
+// TIMELINE: horizontal arrangement
+struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
+{
+    static constexpr int headerW = 190, rowH = 70, rulerH = 28;
+
+    Timeline (Session& s) : session (s) { startTimerHz (30); }
+
+    te::Edit& edit() { return *session.edit; }
+    Array<te::AudioTrack*> tracks() { return te::getAudioTracks (edit()); }
+
+    float xFor (te::TimePosition t) const { return headerW + (float) (t.inSeconds() * pxPerSec) - scrollX; }
+    te::TimePosition timeAt (float x) const { return te::TimePosition::fromSeconds (jmax (0.0, (x - headerW + scrollX) / pxPerSec)); }
+    int rowAt (int y) const { return (y - rulerH) / rowH; }
+    Rectangle<int> rowBounds (int i) const { return { 0, rulerH + i * rowH, getWidth(), rowH }; }
+    Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).reduced (12, 0).withTrimmedTop (38).withHeight (20).withWidth (24); }
+    Rectangle<int> soloBox (int i) const { return muteBox (i).translated (28, 0); }
+    Rectangle<int> fxBox (int i)   const { return muteBox (i).translated (56, 0).withWidth (36); }
+
+    Rectangle<float> clipBounds (int row, te::Clip& c) const
+    {
+        auto p = c.getPosition();
+        return Rectangle<float>::leftTopRightBottom (xFor (p.getStart()), (float) (rulerH + row * rowH + 8),
+                                                     xFor (p.getEnd()), (float) (rulerH + (row + 1) * rowH - 8));
+    }
+
+    void paint (Graphics& g) override
+    {
+        paintBackground (g, getLocalBounds());
+        auto& ts = edit().tempoSequence;
+
+        // ruler: bar numbers
+        g.setColour (sw::colour::card); g.fillRect (0, 0, getWidth(), rulerH);
+        g.setColour (sw::colour::line); g.drawHorizontalLine (rulerH - 1, 0, (float) getWidth());
+        for (int bar = 0; ; ++bar)
+        {
+            auto x = xFor (ts.toTime (te::tempo::BarsAndBeats { .bars = bar }));
+            if (x > getWidth()) break;
+            if (x < headerW) continue;
+            g.setColour (sw::colour::line); g.drawVerticalLine ((int) x, (float) rulerH, (float) getHeight());
+            g.setColour (sw::colour::text2); g.setFont (sw::mono (10.0f));
+            g.drawText (String (bar + 1), (int) x + 4, 0, 40, rulerH, Justification::centredLeft);
+        }
+
+        auto trs = tracks();
+        for (int i = 0; i < trs.size(); ++i)
+        {
+            auto* t = trs[i];
+            auto row = rowBounds (i);
+            g.setColour (sw::colour::line); g.drawHorizontalLine (row.getBottom() - 1, 0, (float) getWidth());
+
+            for (auto c : t->getClips())
+            {
+                auto b = clipBounds (i, *c);
+                if (b.getRight() < headerW) continue;
+                b.setLeft (jmax ((float) headerW, b.getX()));
+                g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 8.0f);
+                g.setColour (c == selected ? sw::colour::text : sw::colour::line);
+                g.drawRoundedRectangle (b.reduced (0.5f), 8.0f, c == selected ? 1.5f : 1.0f);
+                g.setColour (sw::colour::text); g.setFont (sw::mono (11.0f));
+                g.drawText (c->getName().toUpperCase(), b.reduced (8, 4).toNearestInt(), Justification::topLeft);
+            }
+
+            // header card
+            auto h = row.withWidth (headerW).reduced (8, 6).toFloat();
+            sw::paintCard (g, h, 12.0f);
+            g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
+            g.drawText (String (i + 1).paddedLeft ('0', 2) + "  " + t->getName().toUpperCase(),
+                        h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredLeft);
+            auto drawToggle = [&] (Rectangle<int> r, const String& s, bool on, bool red)
+            {
+                g.setColour (on ? (red ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
+                g.fillRoundedRectangle (r.toFloat(), 10.0f);
+                g.setColour (on ? sw::colour::card : sw::colour::text2); g.setFont (sw::mono (10.0f));
+                g.drawText (s, r, Justification::centred);
+            };
+            drawToggle (muteBox (i), "M", t->isMuted (false), false);
+            drawToggle (soloBox (i), "S", t->isSolo (false), true);
+            drawToggle (fxBox (i), "FX " + String (Session::userPlugins (*t).size()), false, false);
+        }
+
+        // playhead
+        auto px = xFor (edit().getTransport().getPosition());
+        if (px >= headerW)
+        {
+            g.setColour (sw::colour::accent);
+            g.fillRect ((float) px, 0.0f, 1.5f, (float) getHeight());
+        }
+
+        if (dropHighlight >= 0)
+        {
+            g.setColour (sw::colour::text.withAlpha (0.06f));
+            g.fillRect (rowBounds (dropHighlight).withTrimmedLeft (headerW));
+        }
+    }
+
+    void timerCallback() override { repaint(); }
+
+    te::Clip* clipAt (Point<int> p, int& rowOut)
+    {
+        rowOut = rowAt (p.y);
+        auto trs = tracks();
+        if (! isPositiveAndBelow (rowOut, trs.size())) return nullptr;
+        for (auto c : trs[rowOut]->getClips())
+            if (clipBounds (rowOut, *c).contains (p.toFloat())) return c;
+        return nullptr;
+    }
+
+    void mouseDown (const MouseEvent& e) override
+    {
+        auto trs = tracks();
+        const int r = rowAt (e.y);
+        if (e.y > rulerH && isPositiveAndBelow (r, trs.size()) && e.x < headerW)
+        {
+            auto* t = trs[r];
+            if (muteBox (r).contains (e.getPosition())) t->setMute (! t->isMuted (false));
+            else if (soloBox (r).contains (e.getPosition())) t->setSolo (! t->isSolo (false));
+            else if (fxBox (r).contains (e.getPosition()) || e.mods.isPopupMenu()) trackMenu (*t);
+            repaint(); return;
+        }
+        int row;
+        selected = clipAt (e.getPosition(), row);
+        if (selected)
+        {
+            if (e.mods.isPopupMenu())
+            {
+                PopupMenu m; m.addItem (1, "Delete clip");
+                m.showMenuAsync ({}, [this, c = te::Clip::Ptr (selected)] (int res)
+                    { if (res == 1) { c->removeFromParent(); selected = nullptr; session.changed(); } });
+                return;
+            }
+            dragStart = selected->getPosition().getStart();
+            return;
+        }
+        if (e.x >= headerW) edit().getTransport().setPosition (timeAt ((float) e.x));
+    }
+
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (! selected || e.mods.isPopupMenu()) return;
+        auto t = te::TimePosition::fromSeconds (jmax (0.0, dragStart.inSeconds() + e.getDistanceFromDragStartX() / pxPerSec));
+        if (! e.mods.isAltDown())   // snap to beats unless Alt
+        {
+            auto& ts = edit().tempoSequence;
+            t = ts.toTime (te::BeatPosition::fromBeats (std::round (ts.toBeats (t).inBeats())));
+        }
+        selected->setStart (t, false, true);
+    }
+
+    void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
+    {
+        if (e.mods.isCommandDown()) pxPerSec = jlimit (5.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15));
+        else scrollX = jmax (0.0f, scrollX - (w.deltaX != 0 ? w.deltaX : w.deltaY) * 300.0f);
+    }
+
+    void trackMenu (te::AudioTrack& t)
+    {
+        PopupMenu m;
+        m.addItem (1, "Add plugin...");
+        auto ps = Session::userPlugins (t);
+        for (int i = 0; i < ps.size(); ++i) m.addItem (100 + i, "Open " + ps[i]->getName());
+        for (int i = 0; i < ps.size(); ++i) m.addItem (200 + i, "Remove " + ps[i]->getName());
+        m.addSeparator();
+        m.addItem (2, "Rename track...");
+        m.addItem (3, "Delete track");
+        m.showMenuAsync ({}, [this, ps, tr = te::AudioTrack::Ptr (&t)] (int r)
+        {
+            if (r == 1) session.choosePluginFor (*tr);
+            else if (r >= 200) { ps[r - 200]->deleteFromParent(); session.changed(); }
+            else if (r >= 100) ps[r - 100]->showWindowExplicitly();
+            else if (r == 2)
+            {
+                auto* w = new AlertWindow ("RENAME", {}, MessageBoxIconType::NoIcon);
+                w->addTextEditor ("n", tr->getName()); w->addButton ("OK", 1); w->addButton ("CANCEL", 0);
+                w->enterModalState (true, ModalCallbackFunction::create ([w, tr] (int ok)
+                    { if (ok) tr->setName (w->getTextEditorContents ("n")); }), true);
+            }
+            else if (r == 3) { edit().deleteTrack (tr.get()); session.changed(); }
+        });
+    }
+
+    // drops: from the browser, or from Explorer/Finder
+    bool isInterestedInDragSource (const SourceDetails& d) override { return d.description == "swfile"; }
+    bool isInterestedInFileDrag (const StringArray& files) override { return isAudioFile (File (files[0])); }
+    void itemDragMove (const SourceDetails& d) override { dropHighlight = rowAt (d.localPosition.y); repaint(); }
+    void fileDragMove (const StringArray&, int, int y) override { dropHighlight = rowAt (y); repaint(); }
+    void itemDragExit (const SourceDetails&) override { dropHighlight = -1; repaint(); }
+    void fileDragExit (const StringArray&) override { dropHighlight = -1; repaint(); }
+    void itemDropped (const SourceDetails& d) override { drop (draggedFile, d.localPosition); }
+    void filesDropped (const StringArray& f, int x, int y) override { drop (File (f[0]), { x, y }); }
+
+    void drop (const File& f, Point<int> p)
+    {
+        dropHighlight = -1;
+        if (! isAudioFile (f) || p.y < rulerH) return;
+        auto trs = tracks();
+        int r = rowAt (p.y);
+        auto* t = isPositiveAndBelow (r, trs.size()) ? trs[r] : session.addTrack();
+        auto& ts = edit().tempoSequence;
+        auto start = ts.toTime (te::BeatPosition::fromBeats (std::round (ts.toBeats (timeAt ((float) p.x)).inBeats())));
+        session.addAudioFile (*t, f, start, false);
+        repaint();
+    }
+
+    Session& session;
+    double pxPerSec = 60.0;
+    float scrollX = 0;
+    te::Clip* selected = nullptr;
+    te::TimePosition dragStart;
+    int dropHighlight = -1;
+};
+
+//==============================================================================
+// GRID: clip launcher. Columns = tracks, rows = scenes, mixer strip underneath.
+struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
+{
+    static constexpr int colW = 132, slotH = 30, headerH = 34, sceneW = 90, stripH = 230;
+
+    struct Strip : Component
+    {
+        Strip (Session& s, te::AudioTrack* t) : session (s), track (t)
+        {
+            fader.setSliderStyle (Slider::LinearVertical);
+            fader.setTextBoxStyle (Slider::TextBoxBelow, false, 60, 18);
+            fader.setRange (-60.0, 6.0, 0.1);
+            fader.setSkewFactorFromMidPoint (-12.0);
+            fader.setTextValueSuffix (" dB");
+            fader.setDoubleClickReturnValue (true, 0.0);
+            fader.setWantsKeyboardFocus (false);
+            auto vol = t ? t->getVolumePlugin() : s.edit->getMasterVolumePlugin().get();
+            fader.setValue (vol->getVolumeDb(), dontSendNotification);
+            fader.onValueChange = [this, vol] { vol->setVolumeDb ((float) fader.getValue()); };
+            addAndMakeVisible (fader);
+            if (t)
+            {
+                for (auto* b : { &mute, &solo }) { b->setClickingTogglesState (true); addAndMakeVisible (b); }
+                mute.setToggleState (t->isMuted (false), dontSendNotification);
+                solo.setToggleState (t->isSolo (false), dontSendNotification);
+                mute.onClick = [this] { track->setMute (mute.getToggleState()); };
+                solo.onClick = [this] { track->setSolo (solo.getToggleState()); };
+                solo.setColour (TextButton::buttonOnColourId, sw::colour::accent);
+                addAndMakeVisible (fx);
+                fx.onClick = [this] { session.choosePluginFor (*track); };
+                stop.onClick = [this] { launch::stopTrack (*track); };
+                addAndMakeVisible (stop);
+                for (auto p : Session::userPlugins (*t))
+                {
+                    auto* b = plugins.add (new Pill (p->getName().toUpperCase().substring (0, 14)));
+                    b->onClick = [p] { p->showWindowExplicitly(); };
+                    addAndMakeVisible (b);
+                }
+            }
+        }
+        void paint (Graphics& g) override { sw::paintCard (g, getLocalBounds().toFloat().reduced (3), 14.0f); }
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (12);
+            if (track)
+            {
+                stop.setBounds (r.removeFromTop (22)); r.removeFromTop (6);
+                for (auto* b : plugins) { b->setBounds (r.removeFromTop (20)); r.removeFromTop (3); }
+                fx.setBounds (r.removeFromTop (20)); r.removeFromTop (6);
+                auto row = r.removeFromBottom (22);
+                mute.setBounds (row.removeFromLeft (row.getWidth() / 2 - 2)); row.removeFromLeft (4); solo.setBounds (row);
+                r.removeFromBottom (6);
+            }
+            fader.setBounds (r);
+        }
+        Session& session; te::AudioTrack* track;
+        Slider fader;
+        Pill mute { "M" }, solo { "S" }, fx { "+ FX" }, stop { "STOP" };
+        OwnedArray<Pill> plugins;
+    };
+
+    ClipGrid (Session& s) : session (s)
+    {
+        rebuild();
+        addAndMakeVisible (stopAll);
+        stopAll.onClick = [this] { for (auto t : te::getAudioTracks (*session.edit)) launch::stopTrack (*t); };
+        startTimerHz (20);
+    }
+
+    void rebuild()
+    {
+        strips.clear();
+        for (auto t : te::getAudioTracks (*session.edit)) addAndMakeVisible (strips.add (new Strip (session, t)));
+        addAndMakeVisible (strips.add (new Strip (session, nullptr)));   // master
+        resized(); repaint();
+    }
+
+    Array<te::AudioTrack*> tracks() { return te::getAudioTracks (*session.edit); }
+    int gridTop() const { return sw::space::m; }
+    Rectangle<int> slotBounds (int col, int row) const
+    {
+        return { sw::space::m + col * colW, gridTop() + headerH + row * slotH, colW, slotH };
+    }
+    int scenesX() const { return sw::space::m + jmax (1, (int) strips.size() - 1) * colW; }
+    Rectangle<int> sceneBounds (int row) const { return { scenesX() + 6, gridTop() + headerH + row * slotH, sceneW, slotH }; }
+
+    void paint (Graphics& g) override
+    {
+        paintBackground (g, getLocalBounds());
+        auto trs = tracks();
+        auto area = Rectangle<int> (sw::space::m, gridTop(), trs.size() * colW, headerH + NumScenes * slotH).toFloat();
+        sw::paintCard (g, area.expanded (4), 16.0f);
+        for (int c = 0; c < trs.size(); ++c)
+        {
+            auto head = Rectangle<int> (sw::space::m + c * colW, gridTop(), colW, headerH).reduced (8, 6);
+            g.setColour (sw::colour::text); g.setFont (sw::display (15.0f));
+            g.drawText (String (c + 1) + " " + trs[c]->getName().toUpperCase(), head, Justification::centredLeft);
+            auto slots = trs[c]->getClipSlotList().getClipSlots();
+            for (int r = 0; r < NumScenes; ++r)
+            {
+                auto b = slotBounds (c, r).reduced (6, 3).toFloat();
+                auto clip = r < slots.size() ? slots[r]->getClip() : nullptr;
+                const bool hl = dropCell == Point<int> (c, r);
+                if (! clip)
+                {
+                    g.setColour (hl ? sw::colour::line : sw::colour::subtle); g.fillRoundedRectangle (b, 6.0f);
+                    g.setColour (sw::colour::dot); g.fillEllipse (b.withSizeKeepingCentre (4, 4));
+                    continue;
+                }
+                auto lh = clip->getLaunchHandle();
+                const bool playing = lh && lh->getPlayingStatus() == te::LaunchHandle::PlayState::playing;
+                const bool queued = lh && lh->getQueuedStatus().has_value();
+                g.setColour (playing ? sw::colour::text : sw::colour::card); g.fillRoundedRectangle (b, 6.0f);
+                g.setColour (queued ? sw::colour::accent : sw::colour::text);
+                g.drawRoundedRectangle (b.reduced (0.5f), 6.0f, 1.0f);
+                // play triangle / stop square
+                auto icon = b.removeFromLeft (22).withSizeKeepingCentre (8, 8);
+                g.setColour (playing ? sw::colour::accent : sw::colour::text);
+                if (playing) g.fillRect (icon);
+                else { Path p; p.addTriangle (icon.getTopLeft(), icon.getBottomLeft(), { icon.getRight(), icon.getCentreY() }); g.fillPath (p); }
+                g.setColour (playing ? sw::colour::card : sw::colour::text); g.setFont (sw::mono (10.0f));
+                g.drawText (clip->getName().toUpperCase(), b.reduced (2, 0).toNearestInt(), Justification::centredLeft);
+            }
+        }
+        // scenes column
+        g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
+        g.drawText ("SCENES", sceneBounds (0).withY (gridTop()).withHeight (headerH), Justification::centred);
+        for (int r = 0; r < NumScenes; ++r)
+        {
+            auto b = sceneBounds (r).reduced (2, 3).toFloat();
+            g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 6.0f);
+            g.setColour (sw::colour::line); g.drawRoundedRectangle (b.reduced (0.5f), 6.0f, 1.0f);
+            g.setColour (sw::colour::text); g.setFont (sw::mono (10.0f));
+            g.drawText ("> " + String (r + 1), b.toNearestInt(), Justification::centred);
+        }
+    }
+
+    void resized() override
+    {
+        auto top = gridTop() + headerH + (NumScenes + 1) * slotH + sw::space::l;
+        for (int i = 0; i < strips.size(); ++i)
+        {
+            const bool master = i == strips.size() - 1;
+            int x = master ? scenesX() + 2 : sw::space::m + i * colW;
+            strips[i]->setBounds (x, top, master ? sceneW + 8 : colW, jmax (stripH, getHeight() - top - sw::space::m));
+        }
+        stopAll.setBounds (sceneBounds (NumScenes).reduced (2, 3).translated (0, 4));
+    }
+
+    void timerCallback() override { repaint (0, 0, getWidth(), gridTop() + headerH + NumScenes * slotH + 8); }
+
+    Point<int> cellAt (Point<int> p) const
+    {
+        return { (p.x - sw::space::m) / colW, (p.y - gridTop() - headerH) / slotH };
+    }
+
+    void mouseDown (const MouseEvent& e) override
+    {
+        auto trs = tracks();
+        for (int r = 0; r < NumScenes; ++r)
+            if (sceneBounds (r).contains (e.getPosition())) { launch::scene (*session.edit, r); return; }
+        auto cell = cellAt (e.getPosition());
+        if (e.x < sw::space::m || ! isPositiveAndBelow (cell.x, trs.size()) || ! isPositiveAndBelow (cell.y, NumScenes)) return;
+        auto slot = trs[cell.x]->getClipSlotList().getClipSlots()[cell.y];
+        if (auto c = slot->getClip())
+        {
+            if (e.mods.isPopupMenu())
+            {
+                PopupMenu m; m.addItem (1, "Delete clip");
+                m.addItem (2, "Copy to TIMELINE at playhead");
+                m.showMenuAsync ({}, [this, cl = te::Clip::Ptr (c), tr = te::AudioTrack::Ptr (trs[cell.x])] (int r)
+                {
+                    if (r == 1) { cl->removeFromParent(); session.changed(); }
+                    if (r == 2)
+                        if (auto wc = dynamic_cast<te::WaveAudioClip*> (cl.get()))
+                            session.addAudioFile (*tr, wc->getOriginalFile(), session.edit->getTransport().getPosition(), false);
+                });
+                return;
+            }
+            launch::toggle (*c);
+        }
+    }
+
+    bool isInterestedInDragSource (const SourceDetails& d) override { return d.description == "swfile"; }
+    bool isInterestedInFileDrag (const StringArray& files) override { return isAudioFile (File (files[0])); }
+    void itemDragMove (const SourceDetails& d) override { dropCell = cellAt (d.localPosition); repaint(); }
+    void fileDragMove (const StringArray&, int x, int y) override { dropCell = cellAt ({ x, y }); repaint(); }
+    void itemDragExit (const SourceDetails&) override { dropCell = { -1, -1 }; repaint(); }
+    void fileDragExit (const StringArray&) override { dropCell = { -1, -1 }; repaint(); }
+    void itemDropped (const SourceDetails& d) override { drop (draggedFile, d.localPosition); }
+    void filesDropped (const StringArray& f, int x, int y) override { drop (File (f[0]), { x, y }); }
+
+    void drop (const File& f, Point<int> p)
+    {
+        dropCell = { -1, -1 };
+        auto cell = cellAt (p);
+        auto trs = tracks();
+        if (! isAudioFile (f) || ! isPositiveAndBelow (cell.y, NumScenes)) return;
+        auto* t = isPositiveAndBelow (cell.x, trs.size()) ? trs[cell.x] : session.addTrack();
+        session.addAudioFile (*t->getClipSlotList().getClipSlots()[cell.y], f, {}, true);
+        repaint();
+    }
+
+    Session& session;
+    OwnedArray<Strip> strips;
+    Pill stopAll { "STOP ALL" };
+    Point<int> dropCell { -1, -1 };
+};
+
+//==============================================================================
+// EXPORT dialog: WAV / MP3 with quality options
+struct ExportPanel : Component
+{
+    ExportPanel (Session& s) : session (s)
+    {
+        format.addItemList ({ "WAV", "MP3" }, 1); format.setSelectedId (1);
+        bits.addItemList ({ "16 bit", "24 bit", "32 bit float" }, 1); bits.setSelectedId (2);
+        rate.addItemList ({ "44100 Hz", "48000 Hz", "88200 Hz", "96000 Hz" }, 1); rate.setSelectedId (2);
+        mp3.addItemList ({ "320 kb/s CBR", "256 kb/s CBR", "192 kb/s CBR", "128 kb/s CBR",
+                           "VBR V0 (best)", "VBR V2", "VBR V4" }, 1); mp3.setSelectedId (1);
+        range.addItemList ({ "Whole song", "Loop region" }, 1); range.setSelectedId (1);
+        norm.addItemList ({ "Off", "Peak 0 dB", "Peak -1 dB", "-14 LUFS (streaming)", "-9 LUFS (loud)" }, 1); norm.setSelectedId (1);
+        dither.setButtonText ("DITHER"); dither.setToggleState (true, dontSendNotification);
+        master.setButtonText ("INCLUDE MASTER FX"); master.setToggleState (true, dontSendNotification);
+        format.onChange = [this] { update(); };
+        for (auto* c : { &format, &bits, &rate, &mp3, &range, &norm }) addAndMakeVisible (c);
+        for (auto* b : { (Component*) &dither, (Component*) &master, (Component*) &go }) addAndMakeVisible (b);
+        go.onClick = [this] { chooseFileAndRender(); };
+        setSize (420, 380);
+        update();
+    }
+
+    void update()
+    {
+        const bool wav = format.getSelectedId() == 1;
+        bits.setEnabled (wav); dither.setEnabled (wav); mp3.setEnabled (! wav);
+        if (! wav && rate.getSelectedId() > 2) rate.setSelectedId (2);
+        status = wav ? "" : (lame().isLibraryLoaded() ? "LAME " + lame().getLibraryVersion() : "MP3 NEEDS LIBMP3LAME (SEE README)");
+        repaint();
+    }
+
+    static te::LibLameEncoderAudioFormat& lame()
+    {
+        static te::LibLameEncoderAudioFormat f (te::LibLameEncoderAudioFormat::getDefaultLibraryName());
+        return f;
+    }
+
+    void paint (Graphics& g) override
+    {
+        paintBackground (g, getLocalBounds());
+        sw::paintCard (g, getLocalBounds().reduced (sw::space::m).toFloat());
+        g.setColour (sw::colour::text); g.setFont (sw::display (22.0f));
+        g.drawText ("EXPORT ( AUDIO )", 32, 22, getWidth() - 64, 28, Justification::centredLeft);
+        const char* labels[] = { "FORMAT", "BIT DEPTH", "SAMPLE RATE", "MP3 QUALITY", "RANGE", "NORMALISE" };
+        for (int i = 0; i < 6; ++i)
+            sw::paintCaption (g, labels[i], { 32, rowY (i), 130, 26 });
+        sw::paintCaption (g, status, { 32, getHeight() - 52, 220, 20 }, Justification::centredLeft,
+                          status.startsWith ("MP3 NEEDS") ? sw::colour::accent : sw::colour::text2);
+    }
+    int rowY (int i) const { return 62 + i * 34; }
+
+    void resized() override
+    {
+        ComboBox* boxes[] = { &format, &bits, &rate, &mp3, &range, &norm };
+        for (int i = 0; i < 6; ++i) boxes[i]->setBounds (170, rowY (i), getWidth() - 202, 26);
+        dither.setBounds (32, rowY (6), 120, 24);
+        master.setBounds (170, rowY (6), 200, 24);
+        go.setBounds (getWidth() - 152, getHeight() - 58, 120, 32);
+    }
+
+    void chooseFileAndRender()
+    {
+        const bool wav = format.getSelectedId() == 1;
+        auto def = session.editFile.getSiblingFile (session.editFile.getFileNameWithoutExtension()).withFileExtension (wav ? "wav" : "mp3");
+        chooser = std::make_unique<FileChooser> ("Export", def, wav ? "*.wav" : "*.mp3");
+        chooser->launchAsync (FileBrowserComponent::saveMode | FileBrowserComponent::warnAboutOverwriting,
+                              [this, wav] (const FileChooser& fc)
+        {
+            auto f = fc.getResult();
+            if (f == File()) return;
+            status = render (f.withFileExtension (wav ? "wav" : "mp3")) ? "EXPORTED: " + f.getFileName() : "EXPORT FAILED";
+            repaint();
+        });
+    }
+
+    bool render (const File& dest)
+    {
+        auto& edit = *session.edit;
+        te::Renderer::Parameters p (edit);
+        static WavAudioFormat wavFormat;
+        const bool wav = format.getSelectedId() == 1;
+        if (! wav && ! lame().isLibraryLoaded()) return false;
+        p.destFile = dest;
+        p.audioFormat = wav ? (AudioFormat*) &wavFormat : (AudioFormat*) &lame();
+        p.bitDepth = wav ? std::array { 16, 24, 32 }[(size_t) bits.getSelectedItemIndex()] : 16;
+        p.sampleRateForAudio = std::array { 44100.0, 48000.0, 88200.0, 96000.0 }[(size_t) rate.getSelectedItemIndex()];
+        if (! wav)   // map our short list to LAME's option list
+        {
+            auto opts = lame().getQualityOptions();
+            const char* names[] = { "320 Kb/s CBR", "256 Kb/s CBR", "192 Kb/s CBR", "128 Kb/s CBR", "VBR quality 0 (best)", "VBR quality 2", "VBR quality 4 (normal)" };
+            p.quality = jmax (0, opts.indexOf (names[mp3.getSelectedItemIndex()]));
+        }
+        auto& tc = edit.getTransport();
+        p.time = range.getSelectedId() == 2 ? tc.getLoopRange() : te::TimeRange (te::TimePosition(), edit.getLength());
+        p.ditheringEnabled = wav && dither.getToggleState() && p.bitDepth < 32;
+        p.useMasterPlugins = master.getToggleState();
+        p.canRenderInMono = false;
+        switch (norm.getSelectedId())
+        {
+            case 2: p.shouldNormalise = true; p.normaliseToLevelDb = 0.0f; break;
+            case 3: p.shouldNormalise = true; p.normaliseToLevelDb = -1.0f; break;
+            case 4: p.shouldNormaliseByLUFS = true; p.normaliseToLevelDb = -14.0f; break;
+            case 5: p.shouldNormaliseByLUFS = true; p.normaliseToLevelDb = -9.0f; break;
+            default: break;
+        }
+        tc.stop (false, false);
+        // ponytail: renders on the message thread (UI waits); move to a background job if songs get long
+        return te::Renderer::renderToFile ("Export", p).existsAsFile();
+    }
+
+    Session& session;
+    ComboBox format, bits, rate, mp3, range, norm;
+    ToggleButton dither, master;
+    Pill go { "EXPORT" };
+    String status;
+    std::unique_ptr<FileChooser> chooser;
+};
+
+//==============================================================================
+// SETTINGS: audio device (driver, card, inputs/outputs, buffer) + plugin folders/scan
+struct SettingsPanel : TabbedComponent
+{
+    SettingsPanel (Session& s) : TabbedComponent (TabbedButtonBar::TabsAtTop)
+    {
+        auto& pm = s.engine.getPluginManager();
+        auto deadMans = settings().getFile().getSiblingFile ("plugin-scan-crashes.txt");
+        auto* audio = new AudioDeviceSelectorComponent (s.engine.getDeviceManager().deviceManager,
+                                                        0, 64, 0, 64, true, true, true, false);
+        auto* plugins = new PluginListComponent (pm.pluginFormatManager, pm.knownPluginList, deadMans, &settings(), false);
+        addTab ("AUDIO", sw::colour::bg, audio, true);
+        addTab ("PLUGINS", sw::colour::bg, plugins, true);
+        setSize (640, 560);
+    }
+};
+
+static void openDialog (const String& title, Component* content)
+{
+    DialogWindow::LaunchOptions o;
+    o.dialogTitle = title; o.content.setOwned (content);
+    o.dialogBackgroundColour = sw::colour::bg;
+    o.useNativeTitleBar = true; o.resizable = true;
+    o.launchAsync();
+}
+
+// BPM readout: drag up/down to change, double-click to type.
+struct BpmBox : Component
+{
+    std::function<void (double)> onChange;
+    double value = 120.0, dragStartValue = 120.0;
+
+    void setValue (double v) { if (v != value) { value = v; repaint(); } }
+    void paint (Graphics& g) override
+    {
+        g.setColour (isMouseOverOrDragging() ? sw::colour::subtle : sw::colour::card);
+        g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1), 15.0f);
+        g.setColour (sw::colour::line); g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 15.0f, 1.0f);
+        auto r = getLocalBounds().reduced (12, 0);
+        g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
+        g.drawText ("BPM", r, Justification::centredRight);
+        g.setColour (sw::colour::text);
+        sw::drawNumber (g, String (value, 2), sw::display (18.0f), (float) r.getX(), (float) r.getCentreY());
+    }
+    void mouseDown (const MouseEvent&) override { dragStartValue = value; }
+    void mouseDrag (const MouseEvent& e) override
+    {
+        set (dragStartValue - e.getDistanceFromDragStartY() * (e.mods.isShiftDown() ? 0.01 : 0.2));
+    }
+    void mouseDoubleClick (const MouseEvent&) override
+    {
+        auto* w = new AlertWindow ("TEMPO", {}, MessageBoxIconType::NoIcon);
+        w->addTextEditor ("v", String (value, 2)); w->addButton ("OK", 1); w->addButton ("CANCEL", 0);
+        w->enterModalState (true, ModalCallbackFunction::create ([this, w] (int ok)
+            { if (ok) set (w->getTextEditorContents ("v").getDoubleValue()); }), true);
+    }
+    void set (double v)
+    {
+        v = jlimit (40.0, 250.0, std::round (v * 100.0) / 100.0);
+        setValue (v);
+        if (onChange) onChange (v);
+    }
+};
+
+//==============================================================================
+// TOP BAR
+struct TopBar : Component, Timer
+{
+    TopBar (Session& s) : session (s)
+    {
+        for (auto* b : { &browser, &timeline, &grid, &play, &stop, &rec, &loop, &metro, &addTrack, &exportBtn, &settingsBtn })
+            addAndMakeVisible (b);
+        for (auto* b : { &browser, &loop, &metro }) b->setClickingTogglesState (true);
+        timeline.setRadioGroupId (1); grid.setRadioGroupId (1);
+        timeline.setClickingTogglesState (true); grid.setClickingTogglesState (true);
+        timeline.setToggleState (true, dontSendNotification);
+        browser.setToggleState (true, dontSendNotification);
+        rec.setColour (TextButton::buttonOnColourId, sw::colour::accent);
+        bpm.onChange = [this] (double v) { session.edit->tempoSequence.getTempos()[0]->setBpm (v); };
+        addAndMakeVisible (bpm);
+
+        auto& tc = session.edit->getTransport();
+        play.onClick = [&tc] { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); };
+        stop.onClick = [&tc] { tc.stop (false, false); tc.setPosition (te::TimePosition()); };
+        rec.onClick  = [&tc] { tc.isRecording() ? tc.stop (false, false) : tc.record (false); };
+        loop.onClick = [this, &tc] { tc.looping = loop.getToggleState(); };
+        metro.onClick = [this] { session.edit->clickTrackEnabled = metro.getToggleState(); };
+        addTrack.onClick = [this] { session.addTrack(); };
+        exportBtn.onClick = [this] { openDialog ("Export", new ExportPanel (session)); };
+        settingsBtn.onClick = [this] { openDialog ("Settings", new SettingsPanel (session)); };
+        startTimerHz (20);
+    }
+
+    void timerCallback() override
+    {
+        auto& tc = session.edit->getTransport();
+        play.setToggleState (tc.isPlaying(), dontSendNotification);
+        rec.setToggleState (tc.isRecording(), dontSendNotification);
+        loop.setToggleState (tc.looping.get(), dontSendNotification);
+        if (! bpm.isMouseButtonDown()) bpm.setValue (session.edit->tempoSequence.getTempos()[0]->getBpm());
+        auto bb = session.edit->tempoSequence.toBarsAndBeats (tc.getPosition());
+        auto pos = String (bb.bars + 1) + "." + String (bb.getWholeBeats() + 1) + "."
+                 + String ((int) (bb.getFractionalBeats().inBeats() * 4) + 1);
+        if (pos != position) { position = pos; repaint(); }
+    }
+
+    void paint (Graphics& g) override
+    {
+        g.setColour (sw::colour::card); g.fillRect (getLocalBounds());
+        g.setColour (sw::colour::line); g.drawHorizontalLine (getHeight() - 1, 0, (float) getWidth());
+        g.setColour (sw::colour::text); g.setFont (sw::display (22.0f));
+        g.drawText ("SOUNDWAVE", 16, 0, 160, getHeight(), Justification::centredLeft);
+        g.setFont (sw::display (24.0f));
+        g.drawText (position, positionArea, Justification::centred);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (10, 10);
+        r.removeFromLeft (170);
+        browser.setBounds (r.removeFromLeft (80)); r.removeFromLeft (12);
+        timeline.setBounds (r.removeFromLeft (86)); r.removeFromLeft (2);
+        grid.setBounds (r.removeFromLeft (60)); r.removeFromLeft (20);
+        bpm.setBounds (r.removeFromLeft (130)); r.removeFromLeft (8);
+        metro.setBounds (r.removeFromLeft (64)); r.removeFromLeft (20);
+        for (auto* b : { &play, &stop, &rec, &loop }) { b->setBounds (r.removeFromLeft (58)); r.removeFromLeft (4); }
+        r.removeFromLeft (8);
+        positionArea = r.removeFromLeft (120);
+        settingsBtn.setBounds (r.removeFromRight (90)); r.removeFromRight (6);
+        exportBtn.setBounds (r.removeFromRight (80)); r.removeFromRight (6);
+        addTrack.setBounds (r.removeFromRight (90));
+    }
+
+    Session& session;
+    Pill browser { "BROWSER" }, timeline { "TIMELINE" }, grid { "GRID" }, play { "PLAY" }, stop { "STOP" },
+         rec { "REC" }, loop { "LOOP" }, metro { "CLICK" }, addTrack { "+ TRACK" }, exportBtn { "EXPORT" }, settingsBtn { "SETTINGS" };
+    BpmBox bpm;
+    String position { "1.1.1" };
+    Rectangle<int> positionArea;
+};
+
+//==============================================================================
+struct MainComponent : Component, DragAndDropContainer
+{
+    MainComponent()
+    {
+        LookAndFeel::setDefaultLookAndFeel (&laf);
+        addAndMakeVisible (top); addAndMakeVisible (browser);
+        addAndMakeVisible (timeline); addChildComponent (grid);
+        top.timeline.onClick = [this] { showGrid (false); };
+        top.grid.onClick = [this] { showGrid (true); };
+        top.browser.onClick = [this] { browser.setVisible (top.browser.getToggleState()); resized(); };
+        session.onChange = [this] { grid.rebuild(); timeline.repaint(); };
+        setWantsKeyboardFocus (true);
+        setSize (1440, 860);
+    }
+    ~MainComponent() override { session.save(); LookAndFeel::setDefaultLookAndFeel (nullptr); }
+
+    void showGrid (bool g)
+    {
+        grid.setVisible (g); timeline.setVisible (! g);
+        top.grid.setToggleState (g, dontSendNotification); top.timeline.setToggleState (! g, dontSendNotification);
+        if (g) grid.rebuild();
+        grabKeyboardFocus();
+    }
+
+    bool keyPressed (const KeyPress& k) override
+    {
+        auto& tc = session.edit->getTransport();
+        const auto c = k.getModifiers().isCommandDown();
+        if (k == KeyPress::tabKey)   { showGrid (! grid.isVisible()); return true; }
+        if (k == KeyPress::spaceKey) { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); return true; }
+        if (k.getTextCharacter() == 'r' && ! c) { top.rec.triggerClick(); return true; }
+        if (c && k.getKeyCode() == 'T') { session.addTrack(); return true; }
+        if (c && k.getKeyCode() == 'S') { session.save(); return true; }
+        if (c && k.getKeyCode() == 'L') { top.loop.triggerClick(); return true; }
+        if (c && k.getKeyCode() == 'Z') { session.edit->getUndoManager().undo(); return true; }
+        if (c && k.getKeyCode() == 'Y') { session.edit->getUndoManager().redo(); return true; }
+        if (c && k.getModifiers().isAltDown() && k.getKeyCode() == 'B') { top.browser.triggerClick(); return true; }
+        if ((k == KeyPress::deleteKey || k == KeyPress::backspaceKey) && timeline.selected)
+        { timeline.selected->removeFromParent(); timeline.selected = nullptr; session.changed(); return true; }
+        return false;
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        top.setBounds (r.removeFromTop (52));
+        if (browser.isVisible()) browser.setBounds (r.removeFromLeft (290));
+        timeline.setBounds (r); grid.setBounds (r);
+    }
+
+    sw::LookAndFeel laf;
+    Session session;
+    Previewer previewer { session.engine.getDeviceManager().deviceManager };
+    TopBar top { session };
+    Browser browser { previewer };
+    Timeline timeline { session };
+    ClipGrid grid { session };
+};
+
+//==============================================================================
+struct SoundWaveApp : JUCEApplication
+{
+    const String getApplicationName() override { return "SoundWave"; }
+    const String getApplicationVersion() override { return "0.1.0"; }
+
+    struct Window : DocumentWindow
+    {
+        Window() : DocumentWindow ("SoundWave", sw::colour::bg, allButtons)
+        {
+            setUsingNativeTitleBar (true);
+            setContentOwned (new MainComponent(), true);
+            setResizable (true, true);
+            centreWithSize (getWidth(), getHeight());
+            setVisible (true);
+        }
+        void closeButtonPressed() override { JUCEApplication::getInstance()->systemRequestedQuit(); }
+    };
+
+    void initialise (const String&) override { window = std::make_unique<Window>(); }
+    void shutdown() override { window.reset(); }
+    std::unique_ptr<Window> window;
+};
+
+START_JUCE_APPLICATION (SoundWaveApp)

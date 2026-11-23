@@ -1,0 +1,42 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch JUCE and Tracktion Engine
+        shell: bash
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --depth 1 JUCE tracktion_engine
+          git -C tracktion_engine submodule update --init --depth 1 modules/juce
+
+      - name: Build plugins (VST3)
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Build SoundWave app
+        run: |
+          cmake -S app -B app/build -G "Visual Studio 17 2022" -A x64
+          cmake --build app/build --config Release --parallel
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/SoundWave dist/VST3
+          cp app/build/SoundWave_artefacts/Release/SoundWave.exe dist/SoundWave/
+          cp -r build/*_artefacts/Release/VST3/*.vst3 dist/VST3/
+          cp LICENSE README.md dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SoundWave-windows
+          path: dist
