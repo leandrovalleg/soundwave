@@ -2262,7 +2262,7 @@ struct DotButton : TextButton
         const auto col = findColour (getToggleState() ? textColourOnId : textColourOffId);
         const auto font = sw::label (jlimit (9.0f, 11.0f, getHeight() * 0.32f));
         const float textW = (float) GlyphArrangement::getStringWidth (font, getButtonText());
-        const float dot = 2.0f, step = 2.6f, glyphW = rows (glyph) ? step * 7 + 6 : 0;
+        const float dot = 1.5f, step = 2.15f, glyphW = rows (glyph) ? step * 7 + 9 : 0;   // small dots, more air
         float x = getWidth() / 2.0f - (glyphW + textW) / 2;
         if (auto* bits = rows (glyph))
         {
