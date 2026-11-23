@@ -246,6 +246,7 @@ struct Session
         scanTimer.cb = [this]
         {
             String name;
+            Logger::writeToLog ("scan: " + scanner->getNextPluginFileThatWillBeScanned());
             if (! scanner->scanNextFile (true, name)) { scanTimer.stopTimer(); scanner.reset(); if (onPluginsScanned) onPluginsScanned(); }
         };
         scanTimer.startTimer (20);
@@ -2044,9 +2045,20 @@ struct SoundWaveApp : JUCEApplication
 
     void initialise (const String& args) override
     {
+        // Log file next to the settings (%APPDATA%\SoundWave\SoundWave.log): startup steps, plugin scan, crashes.
+        logger.reset (new FileLogger (settings().getFile().getSiblingFile ("SoundWave.log"), "SoundWave " + getApplicationVersion(), 512 * 1024));
+        Logger::setCurrentLogger (logger.get());
+        SystemStats::setApplicationCrashHandler ([] (void*) { Logger::writeToLog ("CRASH\n" + SystemStats::getStackBacktrace()); });
+        Logger::writeToLog ("start: " + SystemStats::getOperatingSystemName() + " args=" + args);
+
         if (args.contains ("--selftest")) { setApplicationReturnValue (selfTest (File (args.fromFirstOccurrenceOf ("--selftest", false, false).trim().unquoted())) ? 0 : 1); quit(); return; }
         window = std::make_unique<Window>();
+        Logger::writeToLog ("window open");
+        if (args.contains ("--smoketest"))   // CI: open the real window, let the plugin scan run, then quit cleanly
+            Timer::callAfterDelay (12000, [] { Logger::writeToLog ("smoketest ok"); JUCEApplication::quit(); });
     }
+    void shutdown() override { window.reset(); Logger::writeToLog ("quit"); Logger::setCurrentLogger (nullptr); }
+    std::unique_ptr<FileLogger> logger;
 
     // --selftest <dir>: puts every .wav in <dir> on a track, exports WAV + MP3 next to them, checks they decode.
     static bool selfTest (const File& dir)
@@ -2075,6 +2087,7 @@ struct SoundWaveApp : JUCEApplication
                 hi = jmax (lv[0].getEnd(), -lv[0].getStart());
             }
             const bool good = rendered && r && r->lengthInSamples > 0 && hi > 0.5f;
+            Logger::writeToLog (String (good ? "OK   " : "FAIL ") + out.getFileName() + " bytes=" + String (out.getSize()));
             std::cout << (good ? "OK   " : "FAIL ") << out.getFileName() << " bytes=" << out.getSize()
                       << " secs=" << (r ? r->lengthInSamples / r->sampleRate : 0) << " peak=" << hi << std::endl;
             ok &= good;
@@ -2082,7 +2095,7 @@ struct SoundWaveApp : JUCEApplication
         s.edit->getUndoManager().clearUndoHistory();
         return ok;
     }
-    void shutdown() override { window.reset(); }
+
     std::unique_ptr<Window> window;
 };
 

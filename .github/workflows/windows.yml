@@ -46,6 +46,23 @@ jobs:
           cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DSW_LAME_LIB="$env:GITHUB_WORKSPACE/libmp3lame.dll"
           cmake --build app/build
 
+      - name: Test on Windows (start the app, export WAV + MP3, open the window)
+        shell: pwsh
+        run: |
+          $exe = "app/build/SoundWave_artefacts/Release/SoundWave.exe"
+          $log = "$env:APPDATA\SoundWave\SoundWave.log"
+          $p = Start-Process $exe -ArgumentList "--selftest `"$PWD\demo-samples`"" -PassThru
+          $ok = $p.WaitForExit(180000)
+          Get-Content $log -ErrorAction SilentlyContinue
+          if (-not $ok) { $p.Kill(); throw "selftest hung" }
+          if ($p.ExitCode -ne 0) { throw "selftest failed, exit code $($p.ExitCode)" }
+          $p = Start-Process $exe -ArgumentList "--smoketest" -PassThru
+          $ok = $p.WaitForExit(90000)
+          Get-Content $log -ErrorAction SilentlyContinue
+          if (-not $ok) { $p.Kill(); throw "app hung" }
+          if ($p.ExitCode -ne 0) { throw "app crashed, exit code $($p.ExitCode)" }
+          Remove-Item demo-samples\selftest* -ErrorAction SilentlyContinue
+
       - name: Package
         shell: bash
         run: |
