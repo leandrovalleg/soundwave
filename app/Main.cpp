@@ -2377,6 +2377,14 @@ struct DotButton : TextButton, Timer
 {
     // 8-bit hover: the glyph is redrawn column by column, a red column sweeping left to right in steps
     int animStep = -1;   // -1 idle, 0..7 sweeping
+    // Optional options arrow inside the button (right edge): click it, or right-click anywhere, to open the menu
+    std::function<void()> onMenu;
+    static constexpr int menuW = 16;
+    void mouseDown (const MouseEvent& e) override
+    {
+        if (onMenu && (e.mods.isPopupMenu() || e.x > getWidth() - menuW)) { onMenu(); return; }
+        TextButton::mouseDown (e);
+    }
     void mouseEnter (const MouseEvent& e) override { TextButton::mouseEnter (e); animStep = 0; startTimer (38); repaint(); }
     void timerCallback() override { if (++animStep > 7) { animStep = -1; stopTimer(); } repaint(); }
 
@@ -2433,7 +2441,15 @@ struct DotButton : TextButton, Timer
         const float textW = iconOnly ? 0.0f : (float) GlyphArrangement::getStringWidth (font, getButtonText());
         const float step = jlimit (1.5f, 2.5f, getHeight() / (iconOnly ? 10.0f : 12.0f)), dot = step * 0.74f;
         const float glyphW = rows (glyph) ? step * 7 + (iconOnly ? 0.0f : 7.0f) : 0;
-        float x = getWidth() / 2.0f - (glyphW + textW) / 2;
+        const float contentW = (float) getWidth() - (onMenu ? menuW : 0);
+        float x = contentW / 2.0f - (glyphW + textW) / 2;
+        if (onMenu)   // compact V of five dots at the right edge
+        {
+            const float sp = 2.0f, d = 1.5f, cx = getWidth() - menuW / 2.0f - 2, cy = getHeight() / 2.0f - sp * 0.5f;
+            g.setColour (txt.withAlpha (0.8f));
+            for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
+                g.fillRoundedRectangle (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d, d * 0.28f);
+        }
         auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * 0.28f); };
         if (auto* bits = rows (glyph))
         {
@@ -2471,7 +2487,7 @@ struct TopBar : Component, Timer
 {
     TopBar (Session& s) : session (s)
     {
-        for (auto* b : std::initializer_list<Component*> { &browser, &panel, &timeline, &grid, &tap, &bpm, &sig, &metro, &metroOpts, &quant,
+        for (auto* b : std::initializer_list<Component*> { &browser, &panel, &timeline, &grid, &tap, &bpm, &sig, &metro, &quant,
                                                           &play, &stop, &rec, &loop, &loopLen, &key, &scale, &addTrack, &exportBtn, &settingsBtn })
             addAndMakeVisible (b);
         for (auto* b : { &browser, &panel, &metro, &loop }) b->setClickingTogglesState (true);
@@ -2509,11 +2525,13 @@ struct TopBar : Component, Timer
         rec.onClick  = [this] { session.toggleRecord(); };
         loop.onClick = [this] { transport().looping = loop.getToggleState(); };
         metro.onClick = [this] { session.edit->clickTrackEnabled = metro.getToggleState(); };
-        metroOpts.onClick = [this] { metronomeMenu(); };
+        metro.onMenu = [this] { metronomeMenu(); };
         addTrack.onClick = [this] { session.addTrack(); };
         exportBtn.onClick = [this] { openDialog ("Export", new ExportPanel (session)); };
         settingsBtn.onClick = [this] { openDialog ("Settings", new SettingsPanel (session)); };
         syncFromEdit();
+        loadLayout();
+        for (auto* c : { &sig, &quant, &loopLen, &key, &scale }) c->setWantsKeyboardFocus (false);   // keys stay with the app (Space, Tab, R...)
         startTimerHz (20);
     }
 
@@ -2550,7 +2568,7 @@ struct TopBar : Component, Timer
         m.addSubMenu (String::fromUTF8 ("CUENTA PREVIA AL GRABAR"), count);
         m.addItem (40, "ACENTO EN EL 1", true, e.clickTrackEmphasiseBars.get());
         m.addItem (41, "SOLO AL GRABAR", true, e.clickTrackRecordingOnly.get());
-        m.showMenuAsync (PopupMenu::Options().withTargetComponent (metroOpts), [this] (int r)
+        m.showMenuAsync (PopupMenu::Options().withTargetComponent (metro), [this] (int r)
         {
             auto& ed = *session.edit;
             if (r >= 10 && r < 20) session.setClickSound (r - 10);
@@ -2616,43 +2634,138 @@ struct TopBar : Component, Timer
     }
 
     static constexpr int rowH = 28;   // row 1: menus (placed by MainComponent) + views/project buttons on the right
+
+    // ---- customisable layout: VER > Personalizar barra, then drag items within their row. Saved in the settings.
+    // Row 1 is right-aligned. Row 2 flows from the left; "~" is a spacer that pushes what follows to the right,
+    // "|" is a divider, "pos" / "loopInfo" / "cpu" are painted read-outs.
+    static StringArray defaultRow (int row)
+    {
+        return row == 1 ? StringArray { "browser", "panel", "timeline", "grid", "track", "export", "settings" }
+                        : StringArray { "tap", "bpm", "sig", "metro", "quant", "|", "play", "stop", "rec", "pos", "|",
+                                        "loop", "loopLen", "loopInfo", "~", "key", "scale", "cpu" };
+    }
+    StringArray rowItems[3];
+    bool editing = false;
+    String dragId; int dragRow = 0;
+    std::map<String, Rectangle<int>> itemRects;
+
+    Component* itemComponent (const String& id)
+    {
+        static const char* ids[] { "browser", "panel", "timeline", "grid", "track", "export", "settings", "tap", "bpm", "sig", "metro", "quant", "play", "stop", "rec", "loop", "loopLen", "key", "scale" };
+        Component* comps[] { &browser, &panel, &timeline, &grid, &addTrack, &exportBtn, &settingsBtn, &tap, &bpm, &sig, &metro, &quant, &play, &stop, &rec, &loop, &loopLen, &key, &scale };
+        for (int i = 0; i < (int) std::size (ids); ++i) if (id == ids[i]) return comps[i];
+        return nullptr;
+    }
+    static int itemWidth (const String& id)
+    {
+        static const std::map<String, int> w { { "browser", 82 }, { "panel", 66 }, { "timeline", 82 }, { "grid", 60 }, { "track", 74 }, { "export", 74 },
+            { "settings", 88 }, { "tap", 42 }, { "bpm", 90 }, { "sig", 66 }, { "metro", 86 }, { "quant", 74 }, { "play", 62 }, { "stop", 62 }, { "rec", 58 },
+            { "pos", 84 }, { "loop", 64 }, { "loopLen", 84 }, { "loopInfo", 40 }, { "key", 72 }, { "scale", 96 }, { "cpu", 46 }, { "|", 8 }, { "~", 24 } };
+        auto it = w.find (id); return it != w.end() ? it->second : 40;
+    }
+    void loadLayout()
+    {
+        for (int row : { 1, 2 })
+        {
+            StringArray saved; saved.addTokens (settings().getValue ("barRow" + String (row)), ",", {});
+            auto def = defaultRow (row);
+            auto sorted = [] (StringArray a) { a.sort (false); return a; };
+            rowItems[row] = sorted (saved) == sorted (def) ? saved : def;   // ignore stale or broken layouts
+        }
+    }
+    void saveLayout()
+    {
+        for (int row : { 1, 2 }) settings().setValue ("barRow" + String (row), rowItems[row].joinIntoString (","));
+        settings().saveIfNeeded();
+    }
+    void resetLayout() { rowItems[1] = defaultRow (1); rowItems[2] = defaultRow (2); saveLayout(); resized(); repaint(); }
+    std::function<void (bool)> onEditingChanged;
+    Rectangle<int> doneRect() const { return { 12, 4, 64, rowH - 8 }; }
+    void setEditing (bool e)
+    {
+        editing = e;
+        for (auto* c : getChildren()) c->setInterceptsMouseClicks (! e, ! e);
+        if (onEditingChanged) onEditingChanged (e);
+        repaint();
+    }
+
     void resized() override
     {
-        dividers.clear();
-        auto top = getLocalBounds().removeFromTop (rowH).reduced (10, 4);   // 20 px buttons
-        for (auto* b : { &settingsBtn, &exportBtn, &addTrack }) { b->setBounds (top.removeFromRight (b == &settingsBtn ? 88 : 74)); top.removeFromRight (4); }
-        top.removeFromRight (12);
-        for (auto* b : { &grid, &timeline }) { b->setBounds (top.removeFromRight (b == &grid ? 60 : 82)); top.removeFromRight (3); }
-        top.removeFromRight (8);
-        for (auto* b : { &panel, &browser }) { b->setBounds (top.removeFromRight (b == &panel ? 66 : 82)); top.removeFromRight (3); }
+        itemRects.clear(); dividers.clear();
+        const int gap = 4;
+        // row 1: right-aligned
+        {
+            auto r = getLocalBounds().removeFromTop (rowH).reduced (10, 4);
+            int total = 0; for (auto& id : rowItems[1]) total += itemWidth (id) + gap;
+            int x = r.getRight() - total + gap;
+            for (auto& id : rowItems[1]) { itemRects[id] = { x, r.getY(), itemWidth (id), r.getHeight() }; x += itemWidth (id) + gap; }
+        }
+        // row 2: left flow after the logo, spacers share the room left
+        {
+            auto r = getLocalBounds().withTrimmedTop (rowH).reduced (10, 6);
+            r.removeFromLeft (118);
+            int fixed = 0, spacers = 0;
+            for (auto& id : rowItems[2]) { if (id == "~") ++spacers; else fixed += itemWidth (id); fixed += gap; }
+            const int flex = spacers > 0 ? jmax (itemWidth ("~"), (r.getWidth() - fixed) / spacers) : 0;
+            int x = r.getX();
+            for (auto& id : rowItems[2])
+            {
+                const int w = id == "~" ? flex : itemWidth (id);
+                itemRects[id] = { x, r.getY(), w, r.getHeight() };
+                if (id == "|") dividers.add (x + w / 2);
+                x += w + gap;
+            }
+        }
+        for (auto& [id, rect] : itemRects) if (auto* c = itemComponent (id)) c->setBounds (rect);
+        positionArea = itemRects["pos"]; loopArea = itemRects["loopInfo"]; cpuArea = itemRects["cpu"];
+    }
 
-        auto r = getLocalBounds().withTrimmedTop (rowH).reduced (10, 6);   // 24 px controls
-        auto gap = [&] (int w) { r.removeFromLeft (w); };
-        auto div = [&] { gap (8); dividers.add (r.getX()); gap (8); };
-        r.removeFromLeft (118);
-        tap.setBounds (r.removeFromLeft (42)); gap (4);
-        bpm.setBounds (r.removeFromLeft (90)); gap (4);
-        sig.setBounds (r.removeFromLeft (66)); gap (4);
-        metro.setBounds (r.removeFromLeft (68)); gap (2);
-        metroOpts.setBounds (r.removeFromLeft (r.getHeight())); gap (4);   // square, so it draws a perfect circle
-        quant.setBounds (r.removeFromLeft (74));
-        div();
-        for (auto* b : { &play, &stop, &rec }) { b->setBounds (r.removeFromLeft (b == &rec ? 58 : 62)); gap (4); }
-        positionArea = r.removeFromLeft (84);
-        div();
-        loop.setBounds (r.removeFromLeft (64)); gap (4);
-        loopLen.setBounds (r.removeFromLeft (84)); gap (4);
-        loopArea = r.removeFromLeft (44);
-        cpuArea = r.removeFromRight (46); r.removeFromRight (8);
-        scale.setBounds (r.removeFromRight (96)); r.removeFromRight (4);
-        key.setBounds (r.removeFromRight (72));
+    // ---- edit mode: drag an item left/right within its row
+    void mouseDown (const MouseEvent& e) override
+    {
+        if (! editing) return;
+        if (doneRect().contains (e.getPosition())) { setEditing (false); return; }
+        dragId = {};
+        for (auto& [id, rect] : itemRects)
+            if (rect.expanded (2).contains (e.getPosition())) { dragId = id; dragRow = rowItems[1].contains (id) ? 1 : 2; }
+    }
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (! editing || dragId.isEmpty()) return;
+        auto& items = rowItems[dragRow];
+        const int from = items.indexOf (dragId);
+        int to = 0;
+        for (int i = 0; i < items.size(); ++i)
+            if (e.x > itemRects[items[i]].getCentreX()) to = i + (i < from ? 1 : 0);
+        to = jlimit (0, items.size() - 1, to);
+        if (to != from) { items.move (from, to); resized(); repaint(); }
+    }
+    void mouseUp (const MouseEvent&) override { if (editing && dragId.isNotEmpty()) { saveLayout(); dragId = {}; repaint(); } }
+    void paintOverChildren (Graphics& g) override
+    {
+        if (! editing) return;
+        for (auto& [id, rect] : itemRects)
+        {
+            auto rf = rect.toFloat().expanded (1.5f);
+            g.setColour (id == dragId ? sw::colour::accent.withAlpha (0.18f) : sw::colour::accent.withAlpha (0.06f));
+            g.fillRoundedRectangle (rf, 9.0f);
+            Path p; p.addRoundedRectangle (rf, 9.0f);
+            PathStrokeType (1.0f).createDashedStroke (p, p, std::array { 3.0f, 3.0f }.data(), 2);
+            g.setColour (sw::colour::accent); g.fillPath (p);
+        }
+        auto done = doneRect().toFloat();
+        g.setColour (sw::colour::accent); g.fillRoundedRectangle (done, 8.0f);
+        g.setColour (sw::colour::card); g.setFont (sw::label (9.0f));
+        g.drawText ("LISTO", done, Justification::centred);
+        g.setColour (sw::colour::accent);
+        g.drawText (String::fromUTF8 ("ARRASTRA LOS CONTROLES PARA REORDENARLOS"), doneRect().getRight() + 12, 4, 380, rowH - 8, Justification::centredLeft);
     }
 
     Session& session;
     DotButton browser { "BROWSER", DotButton::browser, "Navegador (Ctrl+Alt+B)" }, panel { "PANEL", DotButton::panel, "Panel inferior (Ctrl+Alt+L)" },
               timeline { "TIMELINE", DotButton::timeline, "Vista TIMELINE (Tab)" }, grid { "GRID", DotButton::grid, "Vista GRID (Tab)" },
-              metro { "CLICK", DotButton::metro, String::fromUTF8 ("Metr\xc3\xb3nomo") },
-              metroOpts { "", DotButton::chevron, String::fromUTF8 ("Opciones del metr\xc3\xb3nomo: sonido, volumen, acento, cuenta previa") }, play { "PLAY", DotButton::play, "Play / pausa (Espacio)" },
+              metro { "CLICK", DotButton::metro, String::fromUTF8 ("Metr\xc3\xb3nomo (flecha o clic derecho: sonido, volumen, acento, cuenta previa)") },
+              play { "PLAY", DotButton::play, "Play / pausa (Espacio)" },
               stop { "STOP", DotButton::stop, "Stop (dos veces: volver al inicio)" },
               rec { "REC", DotButton::rec, "Grabar (R): si no hay ninguna pista armada, arma la seleccionada" },
               loop { "LOOP", DotButton::loop, "Loop (Ctrl+L)" }, addTrack { "TRACK", DotButton::plus, "Nueva pista (Ctrl+T)" },
@@ -2763,6 +2876,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         session.onChange = [this] { grid.rebuild(); timeline.rebuildIO(); detail.refresh(); };
         session.onSelect = [this] { detail.refresh(); timeline.repaint(); };
         timeline.onMidiClipCreated = [this] { if (! detail.isVisible()) top.panel.triggerClick(); };
+        top.onEditingChanged = [this] (bool e) { menu.setVisible (! e); grabKeyboardFocus(); };
         session.onPluginsScanned = [this] { browser.refreshPlugins(); };
         browser.refreshPlugins();
         session.scanPluginsInBackground();
@@ -2794,7 +2908,9 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
             case 3: item (30, "Play / pausa", "Espacio"); item (31, "Grabar", "R"); item (32, "Loop", "Ctrl+L");
                     item (33, String::fromUTF8 ("Metrónomo"), ""); item (34, "Volver al inicio", "Inicio"); break;
             case 4: item (40, "Navegador", "Ctrl+Alt+B"); item (41, "Panel inferior", "Ctrl+Alt+L"); item (42, "TIMELINE / GRID", "Tab");
-                    item (43, "Entradas/salidas (I/O)", ""); break;
+                    item (43, "Entradas/salidas (I/O)", ""); m.addSeparator();
+                    item (44, top.editing ? "Terminar de personalizar" : "Personalizar barra", "");
+                    item (45, "Restablecer barra", ""); break;
             case 5: item (50, "Atajos de teclado", ""); item (51, "Acerca de SoundWave", ""); break;
             default: break;
         }
@@ -2828,6 +2944,8 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
             case 41: top.panel.triggerClick(); break;
             case 42: showGrid (! grid.isVisible()); break;
             case 43: timeline.ioToggle.triggerClick(); break;
+            case 44: top.setEditing (! top.editing); break;
+            case 45: top.resetLayout(); break;
             case 50: AlertWindow::showMessageBoxAsync (MessageBoxIconType::NoIcon, "ATAJOS",
                         String::fromUTF8 ("Espacio  play / pausa\nR  grabar\nTab  TIMELINE / GRID\nCtrl+T  nueva pista\nCtrl+E  cortar clip en el cursor\n"
                         "Ctrl+D  duplicar clip\nSupr  borrar clip\nCtrl+L  loop\nCtrl+Z / Ctrl+Y  deshacer / rehacer\nCtrl+S  guardar\n"
@@ -2891,6 +3009,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
     {
         auto& tc = session.edit->getTransport();
         const auto c = k.getModifiers().isCommandDown();
+        if (top.editing && (k == KeyPress::returnKey || k == KeyPress::escapeKey)) { menuItemSelected (44, 0); return true; }
         if (k == KeyPress::tabKey)   { showGrid (! grid.isVisible()); return true; }
         if (k == KeyPress::spaceKey) { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); return true; }
         if (k.getTextCharacter() == 'r' && ! c) { top.rec.triggerClick(); return true; }
