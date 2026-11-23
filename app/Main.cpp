@@ -1023,6 +1023,17 @@ struct IORow : Component, Timer
         pan.onValueChange = [this, vol] { vol->setPan ((float) pan.getValue()); };
         for (auto* c : { (Component*) &volume, (Component*) &pan }) addAndMakeVisible (c);
         if (ret) return;
+        for (int bus : { 0, 1 })   // sends to the return tracks (A reverb, B delay), like the GRID mixer
+            if (auto snd = Session::sendOf (t, bus))
+            {
+                auto* k = sends.add (new Slider (Slider::RotaryHorizontalVerticalDrag, Slider::NoTextBox));
+                k->setRange (-60.0, 6.0, 0.1); k->setSkewFactorFromMidPoint (-12.0);
+                k->setValue (jmax (-60.0f, snd->getGainDb()), dontSendNotification);
+                k->setDoubleClickReturnValue (true, -60.0);
+                k->setTooltip (String (bus == 0 ? "Envio A (reverb)" : "Envio B (delay)") + String::fromUTF8 (": gira para mandar señal al retorno"));
+                k->onValueChange = [snd, k] { snd->setGainDb (k->getValue() <= -59.9 ? -100.0f : (float) k->getValue()); };
+                addAndMakeVisible (k);
+            }
 
         input.setTooltip (String::fromUTF8 ("De dónde graba esta pista"));
         input.onChange = [this]
@@ -1084,6 +1095,11 @@ struct IORow : Component, Timer
         g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
         auto out = outArea();
         g.drawText ("OUT > MAIN", out, Justification::centredLeft);
+        for (int i = 0; i < sends.size(); ++i)
+        {
+            g.setColour (sw::colour::accent); g.setFont (sw::label (9.0f));
+            g.drawText (i == 0 ? "A" : "B", sends[i]->getBounds().translated (sends[i]->getWidth(), 0).withWidth (10), Justification::centredLeft);
+        }
         g.setColour (sw::colour::text); g.setFont (sw::mono (10.0f));
         g.drawText (String (volume.getValue(), 1) + " dB", out, Justification::centredRight);
         if (arm.getToggleState() && meter != nullptr)   // input level as a row of dots, red near the top
@@ -1114,9 +1130,12 @@ struct IORow : Component, Timer
         auto top = r.removeFromTop (22); r.removeFromTop (5);
         if (! monitor.isEmpty()) arm.setBounds (top.removeFromRight (30));
         pan.setBounds (top.removeFromLeft (22).expanded (2));
+        top.removeFromLeft (6);
+        for (auto* k : sends) { k->setBounds (top.removeFromLeft (22).expanded (2)); top.removeFromLeft (12); }
         volume.setBounds (r.removeFromTop (10).withTrimmedRight (2));
     }
 
+    OwnedArray<Slider> sends;
     Session& session; te::AudioTrack::Ptr track;
     AudioDeviceManager::LevelMeter::Ptr meter;
     ComboBox input; Pill arm { "o" };
@@ -1848,8 +1867,8 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 if (! sends.isEmpty())
                 {
                     auto row = r.removeFromTop (40); r.removeFromTop (10);
-                    for (auto* k : sends) k->setBounds (row.removeFromLeft (row.getWidth() / 2).reduced (6, 0));
-                    if (sends.size() == 2) sends[1]->setBounds (row.reduced (6, 0));
+                    const int half = row.getWidth() / 2;   // A and B the same size
+                    for (auto* k : sends) k->setBounds (row.removeFromLeft (half).reduced (6, 0));
                 }
                 for (auto* b : plugins) { b->setBounds (r.removeFromTop (20)); r.removeFromTop (3); }
                 fx.setBounds (r.removeFromTop (20)); r.removeFromTop (6);
@@ -3828,17 +3847,22 @@ struct SoundWaveApp : JUCEApplication
     const String getApplicationName() override { return "SoundWave"; }
     const String getApplicationVersion() override { return "0.8.0"; }   // BETA 0.8
 
-    struct Window : DocumentWindow
+    struct Window : DocumentWindow, KeyListener
     {
         Window() : DocumentWindow ("SoundWave", sw::colour::bg, allButtons)
         {
             setUsingNativeTitleBar (true);
-            setContentOwned (new MainComponent(), true);
+            auto* mc = new MainComponent();
+            setContentOwned (mc, true);
+            addKeyListener (this);
             setResizable (true, true);
             centreWithSize (getWidth(), getHeight());
             setVisible (true);
         }
         void closeButtonPressed() override { JUCEApplication::getInstance()->systemRequestedQuit(); }
+        // keys nobody inside handled (e.g. no control has focus) still reach the app's shortcuts
+        bool keyPressed (const KeyPress& k, Component*) override
+        { if (auto* mc = dynamic_cast<MainComponent*> (getContentComponent())) return mc->keyPressed (k); return false; }
     };
 
     void initialise (const String& args) override
