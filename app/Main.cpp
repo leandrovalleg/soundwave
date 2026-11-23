@@ -1626,7 +1626,7 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
 
 //==============================================================================
 // Project key and scale (bit n = semitone n above the root)
-static const StringArray keyNames { "NO KEY", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+static const StringArray keyNames { "KEY", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
 static const StringArray scaleNames { "MAJOR", "MINOR", "DORIAN", "HARM. MINOR", "PENT. MAJOR", "PENT. MINOR", "BLUES" };
 static int scaleMask (int i) { static const int m[] { 0b101010110101, 0b010110101101, 0b011010101101, 0b100110101101, 0b001010010101, 0b010010101001, 0b010011101001 }; return m[jlimit (0, 6, i)]; }
 
@@ -2370,70 +2370,86 @@ struct BpmBox : Component
 
 //==============================================================================
 // TOP BAR: views | tempo & timing | transport | loop | key | CPU | project
-// Pill button with a small dot-matrix glyph (5x5) before its label, in the same style as the logo
+// Button with a 7x7 dot glyph before its label. Dots are soft squares in three tones:
+// '1' main (black), '2' secondary (translucent grey), '3' detail (red). Corners 10 px; icon-only buttons are circles.
+// Pressed look depends on the job: views go light grey, transport goes soft red, REC goes solid red.
 struct DotButton : TextButton
 {
-    enum Glyph { none, play, stop, rec, loop, click, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro };
+    enum Glyph { none, play, stop, rec, loop, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro };
+    enum class OnStyle { grey, redSoft, redSolid };
     int beatLight = 0;   // metro: 0 idle, 1 first beat of the bar, 2 other beats
+    OnStyle onStyle = OnStyle::grey;
     DotButton (const String& label, Glyph g, const String& tip) : TextButton (label), glyph (g) { setTooltip (tip); setWantsKeyboardFocus (false); }
 
-    // 7x7 dot glyphs, row by row ('1' = dot)
     static const char* rows (Glyph g)
     {
         switch (g)
         {
-            case play     : return "1......111....11111..111111111111..111....1......";
-            case stop     : return "........11111..11111..11111..11111..11111........";
-            case rec      : return "..111...11111.111111111111111111111.11111...111..";
-            case loop     : return "..1.....1111111.1...11.....11...1.1111111.....1..";
-            case click    : return "...1......1.....1.1....1.1...1...1..1...1.1111111";
-            case browser  : return "111111111....111....111....111....111....11111111";
-            case panel    : return "11111111.....11.....11.....1111111111111111111111";
-            case timeline : return "1111............11111.......111..............1111";
-            case grid     : return "111.111111.111111.111.......111.111111.111111.111";
-            case plus     : return "...1......1......1...1111111...1......1......1...";
-            case gear     : return "1..1..1.11111..1...1.11...11.1...1..11111.1..1..1";
-            case exportUp : return "...1.....111...1.1.1....1......1...1.....11111111";
-            case chevron  : return ".................................................";   // drawn by hand below
+            case play     : return "1......121....12221..122222312221..121....1......";
+            case stop     : return "1111111122222112222211222221122222112222211111111";
+            case rec      : return "..111...13331.133333113333311333331.13331...111..";
+            case loop     : return "..3.....3111111.3...11.....11...3.1111113.....3..";
+            case browser  : return "111111112....112....112....112....112....11111111";
+            case panel    : return "11111111.....11.....11111111122222112222211111111";
+            case timeline : return "1111............33333.......111..............2222";
+            case grid     : return "111.333111.333111.333.......222.111222.111222.111";
+            case plus     : return "...1......1......1...1113111...1......1......1...";
+            case gear     : return "2..1..2.11111..1...1.11.3.11.1...1..11111.2..1..2";
+            case exportUp : return "...3.....333...3.3.3....3......1...1.....11111111";
+            case chevron  : return "..............1.....1.1...1...1.1.....3..........";
             case metro    : return ".................................................";   // drawn by hand below
             default:       return nullptr;
         }
     }
 
-    void paintButton (Graphics& g, bool over, bool down) override
+    void paintButton (Graphics& g, bool over, bool) override
     {
-        getLookAndFeel().drawButtonBackground (g, *this, findColour (getToggleState() ? buttonOnColourId : buttonColourId), over, down);
-        const auto col = findColour (getToggleState() ? textColourOnId : textColourOffId);
+        namespace C = sw::colour;   // ('text' alone would be Button::text here)
+        const bool on = getToggleState();
+        const bool iconOnly = getButtonText().isEmpty();
+        Colour bg = over ? C::subtle : C::card, border = C::line, txt = C::text, main = C::text,
+               second = C::text.withAlpha (0.32f), detail = C::accent;
+        if (on)
+        {
+            switch (onStyle)
+            {
+                case OnStyle::grey:     bg = Colour (0xffe4e4e4); border = bg; break;
+                case OnStyle::redSoft:  bg = C::accent.withAlpha (0.09f); border = C::accent.withAlpha (0.35f);
+                                        txt = main = detail = C::accent; second = C::accent.withAlpha (0.35f); break;
+                case OnStyle::redSolid: bg = border = C::accent; txt = main = detail = C::card; second = C::card.withAlpha (0.5f); break;
+            }
+        }
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        const float rad = iconOnly ? r.getHeight() / 2 : jmin (10.0f, r.getHeight() / 2);
+        g.setColour (bg); g.fillRoundedRectangle (r, rad);
+        g.setColour (border); g.drawRoundedRectangle (r, rad, 1.0f);
+
         const auto font = sw::label (jlimit (9.0f, 11.0f, getHeight() * 0.32f));
-        const float textW = (float) GlyphArrangement::getStringWidth (font, getButtonText());
-        const float dot = 1.5f, step = 2.15f;   // small dots, more air
-        const float glyphW = rows (glyph) ? step * 7 + (getButtonText().isEmpty() ? 0.0f : 9.0f) : 0;   // icon-only buttons stay centred
+        const float textW = iconOnly ? 0.0f : (float) GlyphArrangement::getStringWidth (font, getButtonText());
+        const float step = iconOnly ? 2.5f : 2.15f, dot = step * 0.72f;
+        const float glyphW = rows (glyph) ? step * 7 + (iconOnly ? 0.0f : 9.0f) : 0;
         float x = getWidth() / 2.0f - (glyphW + textW) / 2;
+        auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * 0.28f); };
         if (auto* bits = rows (glyph))
         {
             const float y0 = getHeight() / 2.0f - step * 3.5f;
-            g.setColour (glyph == rec && ! getToggleState() ? sw::colour::accent : col);
             for (int i = 0; i < 49 && bits[i]; ++i)
-                if (bits[i] == '1') g.fillEllipse (x + (i % 7) * step, y0 + (i / 7) * step, dot, dot);
-            if (glyph == chevron)   // compact V of five bold dots
             {
-                const float d = 2.6f, sp = 3.4f, cx = getWidth() / 2.0f, cy = getHeight() / 2.0f - sp * 0.5f;
-                g.setColour (col);
-                for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
-                    g.fillEllipse (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d);
+                if (bits[i] == '.') continue;
+                g.setColour (bits[i] == '1' ? main : bits[i] == '2' ? second : detail);
+                square (x + (i % 7) * step, y0 + (i / 7) * step, dot);
             }
             if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
             {
                 const float d = step * 2.4f, cy = getHeight() / 2.0f;
-                auto dim = col.withAlpha (0.25f);
-                g.setColour (beatLight == 1 ? sw::colour::accent : beatLight == 2 ? dim : col);
-                g.fillEllipse (x + step * 0.2f, cy - d / 2, d, d);
-                g.setColour (beatLight == 2 ? col : beatLight == 1 ? dim : col);
-                g.fillEllipse (x + step * 4.0f, cy - d / 2, d, d);
+                g.setColour (beatLight == 1 ? detail : beatLight == 2 ? second : main);
+                square (x + step * 0.2f, cy - d / 2, d);
+                g.setColour (beatLight == 2 ? main : second);
+                square (x + step * 4.0f, cy - d / 2, d);
             }
             x += glyphW;
         }
-        g.setColour (col); g.setFont (font);
+        g.setColour (txt); g.setFont (font);
         g.drawText (getButtonText(), Rectangle<float> (x, 0, textW + 2, (float) getHeight()), Justification::centredLeft);
     }
     Glyph glyph;
@@ -2448,7 +2464,8 @@ struct TopBar : Component, Timer
                                                           &play, &stop, &rec, &loop, &loopLen, &key, &scale, &addTrack, &exportBtn, &settingsBtn })
             addAndMakeVisible (b);
         for (auto* b : { &browser, &panel, &metro, &loop }) b->setClickingTogglesState (true);
-        rec.setColour (TextButton::buttonOnColourId, sw::colour::accent);
+        for (auto* b : { &play, &loop, &metro }) b->onStyle = DotButton::OnStyle::redSoft;
+        rec.onStyle = DotButton::OnStyle::redSolid;
         browser.setToggleState (true, dontSendNotification); panel.setToggleState (true, dontSendNotification);
         timeline.setRadioGroupId (1); grid.setRadioGroupId (1);
         timeline.setClickingTogglesState (true); grid.setClickingTogglesState (true);
@@ -2642,6 +2659,28 @@ struct TopBar : Component, Timer
 //==============================================================================
 struct AppLook : sw::LookAndFeel
 {
+    // Style B: 10 px corners for buttons and drop-downs, chevron made of soft-square dots
+    void drawButtonBackground (Graphics& g, Button& b, const Colour&, bool over, bool) override
+    {
+        auto r = b.getLocalBounds().toFloat().reduced (0.5f);
+        const float rad = jmin (10.0f, r.getHeight() / 2);
+        const bool on = b.getToggleState();
+        g.setColour (on ? b.findColour (TextButton::buttonOnColourId) : over ? sw::colour::subtle : sw::colour::card);
+        g.fillRoundedRectangle (r, rad);
+        g.setColour (on ? b.findColour (TextButton::buttonOnColourId) : sw::colour::line);
+        g.drawRoundedRectangle (r, rad, 1.0f);
+    }
+    void drawComboBox (Graphics& g, int w, int h, bool, int, int, int, int, ComboBox& cb) override
+    {
+        auto r = Rectangle<float> (0, 0, (float) w, (float) h).reduced (0.5f);
+        g.setColour (cb.isMouseOver (true) ? sw::colour::subtle : sw::colour::card); g.fillRoundedRectangle (r, jmin (10.0f, r.getHeight() / 2));
+        g.setColour (sw::colour::line); g.drawRoundedRectangle (r, jmin (10.0f, r.getHeight() / 2), 1.0f);
+        const float sp = 2.6f, d = 1.9f, cx = w - 16.0f, cy = h / 2.0f - sp * 0.5f;
+        g.setColour (sw::colour::text);
+        for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
+            g.fillRoundedRectangle (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d, d * 0.28f);
+    }
+
     // Dot glyphs for the browser (option A): red outline folder, black page with a wave
     static Image dots (std::initializer_list<const char*> rows, Colour c, float h)
     {
