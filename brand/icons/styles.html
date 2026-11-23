@@ -1,0 +1,55 @@
+<html><head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@900&family=Space+Mono&display=swap"></head>
+<body style="margin:0;background:#EFEFEF;font-family:'Space Mono',monospace;padding:18px 22px">
+<script>
+// '1' black, '2' grey (translucent), '3' red
+const G={
+ play:    ["1......","121....","12221..","1222223","12221..","121....","1......"],
+ stop:    ["1111111","1222221","1222221","1222221","1222221","1222221","1111111"],
+ rec:     ["..111..",".13331.","1333331","1333331","1333331",".13331.","..111.."],
+ loop:    ["..3....",".311111","1.3...1","1.....1","1...3.1","111113.","....3.."],
+ browser: ["1111111","12....1","12....1","12....1","12....1","12....1","1111111"],
+ panel:   ["1111111","1.....1","1.....1","1111111","1222221","1222221","1111111"],
+ timeline:["1111...",".......","..33333",".......","111....",".......","...2222"],
+ grid:    ["111.333","111.333","111.333",".......","222.111","222.111","222.111"],
+ plus:    ["...1...","...1...","...1...","1113111","...1...","...1...","...1..."],
+ gear:    ["2..1..2",".11111.",".1...1.","11.3.11",".1...1.",".11111.","2..1..2"],
+ exportUp:["...3...","..333..",".3.3.3.","...3...","...1...","1.....1","1111111"],
+ chevron: [".......",".......","1.....1",".1...1.","..1.1..","...3...","......."],
+};
+const TONE={ '1':'rgba(17,17,17,1)', '2':'rgba(17,17,17,0.32)', '3':'#D71921' };
+function glyph(name, shape, px=17, onDark=false){
+  const c=document.createElement('canvas'); c.width=c.height=px*2; c.style.width=c.style.height=px+'px';
+  const x=c.getContext('2d'); x.scale(2,2); const s=px/7;
+  G[name].forEach((row,j)=>[...row].forEach((ch,i)=>{ if(ch==='.')return;
+    let col=TONE[ch]; if(onDark && ch==='1') col='#fff'; if(onDark && ch==='2') col='rgba(255,255,255,0.4)';
+    x.fillStyle=col; const cx=i*s+s/2, cy=j*s+s/2, r=s*0.4;
+    x.beginPath();
+    if(shape==='round') x.arc(cx,cy,r,0,7);
+    else x.roundRect(cx-r,cy-r,r*2,r*2, shape==='soft'? r*0.55 : r*0.12);
+    x.fill(); }));
+  return c;
+}
+function btn(label, g, shape, radius, opts={}){
+  const b=document.createElement('div');
+  const dark=!!opts.on;
+  b.style.cssText=`display:inline-flex;align-items:center;gap:9px;height:34px;padding:0 ${label?14:0}px;${label?'':'width:34px;justify-content:center;'}
+    border:1px solid ${dark?'#111':'#DADADA'};background:${dark?'#111':'#fff'};color:${dark?'#fff':'#111'};border-radius:${radius};font-size:10px;letter-spacing:.12em;box-sizing:border-box`;
+  if(g) b.appendChild(glyph(g,shape,16,dark));
+  if(label){ const t=document.createElement('span'); t.textContent=label; b.appendChild(t); }
+  return b;
+}
+function bar(title, shape, radius){
+  const w=document.createElement('div'); w.style.cssText='background:#fff;border:1px solid #DADADA;border-radius:16px;padding:12px 14px;margin-bottom:14px';
+  w.innerHTML='<div style="font-family:Doto;font-size:18px;margin-bottom:10px">'+title+'</div>';
+  const r1=document.createElement('div'); r1.style.cssText='display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px';
+  [['BROWSER','browser',1],['PANEL','panel',1],['TIMELINE','timeline',1],['GRID','grid',0],['TRACK','plus',0],['EXPORT','exportUp',0],['SETTINGS','gear',0]]
+    .forEach(([l,g,on])=>r1.appendChild(btn(l,g,shape,radius,{on})));
+  const r2=document.createElement('div'); r2.style.cssText='display:flex;gap:5px;flex-wrap:wrap;align-items:center';
+  const metro=btn('CLICK',null,shape,radius); const m=document.createElement('span'); m.innerHTML='<span style="display:inline-block;width:7px;height:7px;border-radius:'+(shape==='round'?'50%':shape==='soft'?'2px':'0')+';background:#D71921"></span> <span style="display:inline-block;width:7px;height:7px;border-radius:'+(shape==='round'?'50%':shape==='soft'?'2px':'0')+';background:#111;opacity:.32"></span>'; metro.prepend(m);
+  [btn('TAP',null,shape,radius), metro, btn('','chevron',shape,'50%'), btn('PLAY','play',shape,radius,{on:1}), btn('STOP','stop',shape,radius), btn('REC','rec',shape,radius), btn('LOOP','loop',shape,radius)].forEach(e=>r2.appendChild(e));
+  w.appendChild(r1); w.appendChild(r2); document.body.appendChild(w);
+}
+bar('A  PUNTOS REDONDOS · PÍLDORA', 'round', '999px');
+bar('B  PUNTOS SUAVES · ESQUINA 10', 'soft', '10px');
+bar('C  PUNTOS CUADRADOS · ESQUINA 4', 'square', '4px');
+</script></body></html>
