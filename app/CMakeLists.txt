@@ -19,7 +19,7 @@ target_sources(SoundWave PRIVATE Main.cpp)
 
 # MP3 encoder (LAME, LGPL) embedded in the exe so the app is a single file. CI passes -DSW_LAME_LIB=<path>.
 if (SW_LAME_LIB AND EXISTS "${SW_LAME_LIB}")
-    juce_add_binary_data(SWLame NAMESPACE LameData SOURCES "${SW_LAME_LIB}")
+    juce_add_binary_data(SWLame HEADER_NAME LameData.h NAMESPACE LameData SOURCES "${SW_LAME_LIB}")
     target_link_libraries(SoundWave PRIVATE SWLame)
     target_compile_definitions(SoundWave PRIVATE SW_EMBEDDED_LAME=1)
 endif()
