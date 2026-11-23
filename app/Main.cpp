@@ -2331,13 +2331,13 @@ struct BpmBox : Component
     void paint (Graphics& g) override
     {
         g.setColour (isMouseOverOrDragging() ? sw::colour::subtle : sw::colour::card);
-        g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1), 15.0f);
-        g.setColour (sw::colour::line); g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 15.0f, 1.0f);
-        auto r = getLocalBounds().reduced (12, 0);
-        g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
+        g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1), 10.0f);
+        g.setColour (sw::colour::line); g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 10.0f, 1.0f);
+        auto r = getLocalBounds().reduced (9, 0);
+        g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
         g.drawText ("BPM", r, Justification::centredRight);
         g.setColour (sw::colour::text);
-        sw::drawNumber (g, String (value, 2), sw::display (18.0f), (float) r.getX(), (float) r.getCentreY());
+        sw::drawNumber (g, String (value, 2), sw::display (14.0f), (float) r.getX(), (float) r.getCentreY());
     }
     BpmBox()
     {
@@ -2373,8 +2373,13 @@ struct BpmBox : Component
 // Button with a 7x7 dot glyph before its label. Dots are soft squares in three tones:
 // '1' main (black), '2' secondary (translucent grey), '3' detail (red). Corners 10 px; icon-only buttons are circles.
 // Pressed look depends on the job: views go light grey, transport goes soft red, REC goes solid red.
-struct DotButton : TextButton
+struct DotButton : TextButton, Timer
 {
+    // 8-bit hover: the glyph is redrawn column by column, a red column sweeping left to right in steps
+    int animStep = -1;   // -1 idle, 0..7 sweeping
+    void mouseEnter (const MouseEvent& e) override { TextButton::mouseEnter (e); animStep = 0; startTimer (38); repaint(); }
+    void timerCallback() override { if (++animStep > 7) { animStep = -1; stopTimer(); } repaint(); }
+
     enum Glyph { none, play, stop, rec, loop, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro };
     enum class OnStyle { grey, redSoft, redSolid };
     int beatLight = 0;   // metro: 0 idle, 1 first beat of the bar, 2 other beats
@@ -2424,28 +2429,34 @@ struct DotButton : TextButton
         g.setColour (bg); g.fillRoundedRectangle (r, rad);
         g.setColour (border); g.drawRoundedRectangle (r, rad, 1.0f);
 
-        const auto font = sw::label (jlimit (9.0f, 11.0f, getHeight() * 0.32f));
+        const auto font = sw::label (jlimit (8.0f, 10.0f, getHeight() * 0.38f));
         const float textW = iconOnly ? 0.0f : (float) GlyphArrangement::getStringWidth (font, getButtonText());
-        const float step = iconOnly ? 2.5f : 2.15f, dot = step * 0.72f;
-        const float glyphW = rows (glyph) ? step * 7 + (iconOnly ? 0.0f : 9.0f) : 0;
+        const float step = jlimit (1.5f, 2.5f, getHeight() / (iconOnly ? 10.0f : 12.0f)), dot = step * 0.74f;
+        const float glyphW = rows (glyph) ? step * 7 + (iconOnly ? 0.0f : 7.0f) : 0;
         float x = getWidth() / 2.0f - (glyphW + textW) / 2;
         auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * 0.28f); };
         if (auto* bits = rows (glyph))
         {
             const float y0 = getHeight() / 2.0f - step * 3.5f;
+            // one colour per icon: REC is red, the rest take the button's ink (black, red or white when pressed)
+            const Colour ink = glyph == rec && ! on ? C::accent : main;
             for (int i = 0; i < 49 && bits[i]; ++i)
             {
                 if (bits[i] == '.') continue;
-                g.setColour (bits[i] == '1' ? main : bits[i] == '2' ? second : detail);
+                const int column = i % 7;
+                if (animStep >= 0 && column > animStep) continue;        // 8-bit hover: drawn column by column
+                g.setColour (animStep >= 0 && column == animStep ? ink.withAlpha (0.45f) : ink);
                 square (x + (i % 7) * step, y0 + (i / 7) * step, dot);
             }
             if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
             {
                 const float d = step * 2.4f, cy = getHeight() / 2.0f;
-                g.setColour (beatLight == 1 ? detail : beatLight == 2 ? second : main);
+                // both dots share one colour: red on beat 1, black otherwise; the dot for the current beat is full, the other faint
+                const Colour ink = beatLight == 1 ? (on ? main : C::accent) : main;
+                const bool hideR = animStep >= 0 && animStep < 4;
+                g.setColour (beatLight == 2 ? ink.withAlpha (0.3f) : ink);
                 square (x + step * 0.2f, cy - d / 2, d);
-                g.setColour (beatLight == 2 ? main : second);
-                square (x + step * 4.0f, cy - d / 2, d);
+                if (! hideR) { g.setColour (beatLight == 1 ? ink.withAlpha (0.3f) : ink); square (x + step * 4.0f, cy - d / 2, d); }
             }
             x += glyphW;
         }
@@ -2595,46 +2606,46 @@ struct TopBar : Component, Timer
         g.setColour (sw::colour::line); g.drawHorizontalLine (getHeight() - 1, 0, (float) getWidth());
         g.drawHorizontalLine (rowH, 0, (float) getWidth());
         for (auto x : dividers) g.drawVerticalLine (x, rowH + 12.0f, getHeight() - 12.0f);
-        g.setColour (sw::colour::text); g.setFont (sw::display (20.0f));
-        g.drawText ("SOUNDWAVE", 14, rowH, 130, getHeight() - rowH, Justification::centredLeft);
-        g.setFont (sw::display (22.0f));
+        g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
+        g.drawText ("SOUNDWAVE", 12, rowH, 110, getHeight() - rowH, Justification::centredLeft);
+        g.setFont (sw::display (17.0f));
         g.drawText (position, positionArea, Justification::centred);
         g.setColour (sw::colour::text2); g.setFont (sw::mono (10.0f));
         g.drawText (loopText, loopArea, Justification::centredLeft);
         g.drawText (cpu, cpuArea, Justification::centredRight);
     }
 
-    static constexpr int rowH = 36;   // row 1: menus (placed by MainComponent) + views/project buttons on the right
+    static constexpr int rowH = 28;   // row 1: menus (placed by MainComponent) + views/project buttons on the right
     void resized() override
     {
         dividers.clear();
-        auto top = getLocalBounds().removeFromTop (rowH).reduced (10, 5);
-        for (auto* b : { &settingsBtn, &exportBtn, &addTrack }) { b->setBounds (top.removeFromRight (b == &settingsBtn ? 104 : 88)); top.removeFromRight (4); }
-        top.removeFromRight (14);
-        for (auto* b : { &grid, &timeline }) { b->setBounds (top.removeFromRight (b == &grid ? 70 : 96)); top.removeFromRight (3); }
-        top.removeFromRight (10);
-        for (auto* b : { &panel, &browser }) { b->setBounds (top.removeFromRight (b == &panel ? 78 : 96)); top.removeFromRight (3); }
+        auto top = getLocalBounds().removeFromTop (rowH).reduced (10, 4);   // 20 px buttons
+        for (auto* b : { &settingsBtn, &exportBtn, &addTrack }) { b->setBounds (top.removeFromRight (b == &settingsBtn ? 88 : 74)); top.removeFromRight (4); }
+        top.removeFromRight (12);
+        for (auto* b : { &grid, &timeline }) { b->setBounds (top.removeFromRight (b == &grid ? 60 : 82)); top.removeFromRight (3); }
+        top.removeFromRight (8);
+        for (auto* b : { &panel, &browser }) { b->setBounds (top.removeFromRight (b == &panel ? 66 : 82)); top.removeFromRight (3); }
 
-        auto r = getLocalBounds().withTrimmedTop (rowH).reduced (10, 9);
+        auto r = getLocalBounds().withTrimmedTop (rowH).reduced (10, 6);   // 24 px controls
         auto gap = [&] (int w) { r.removeFromLeft (w); };
         auto div = [&] { gap (8); dividers.add (r.getX()); gap (8); };
-        r.removeFromLeft (140);
-        tap.setBounds (r.removeFromLeft (52)); gap (4);
-        bpm.setBounds (r.removeFromLeft (110)); gap (4);
-        sig.setBounds (r.removeFromLeft (78)); gap (4);
-        metro.setBounds (r.removeFromLeft (80)); gap (2);
-        metroOpts.setBounds (r.removeFromLeft (28)); gap (4);
-        quant.setBounds (r.removeFromLeft (84));
+        r.removeFromLeft (118);
+        tap.setBounds (r.removeFromLeft (42)); gap (4);
+        bpm.setBounds (r.removeFromLeft (90)); gap (4);
+        sig.setBounds (r.removeFromLeft (66)); gap (4);
+        metro.setBounds (r.removeFromLeft (68)); gap (2);
+        metroOpts.setBounds (r.removeFromLeft (r.getHeight())); gap (4);   // square, so it draws a perfect circle
+        quant.setBounds (r.removeFromLeft (74));
         div();
-        for (auto* b : { &play, &stop, &rec }) { b->setBounds (r.removeFromLeft (b == &rec ? 70 : 76)); gap (4); }
-        positionArea = r.removeFromLeft (100);
+        for (auto* b : { &play, &stop, &rec }) { b->setBounds (r.removeFromLeft (b == &rec ? 58 : 62)); gap (4); }
+        positionArea = r.removeFromLeft (84);
         div();
-        loop.setBounds (r.removeFromLeft (78)); gap (4);
-        loopLen.setBounds (r.removeFromLeft (96)); gap (4);
+        loop.setBounds (r.removeFromLeft (64)); gap (4);
+        loopLen.setBounds (r.removeFromLeft (84)); gap (4);
         loopArea = r.removeFromLeft (44);
-        cpuArea = r.removeFromRight (52); r.removeFromRight (8);
-        scale.setBounds (r.removeFromRight (110)); r.removeFromRight (4);
-        key.setBounds (r.removeFromRight (96));
+        cpuArea = r.removeFromRight (46); r.removeFromRight (8);
+        scale.setBounds (r.removeFromRight (96)); r.removeFromRight (4);
+        key.setBounds (r.removeFromRight (72));
     }
 
     Session& session;
@@ -2670,12 +2681,19 @@ struct AppLook : sw::LookAndFeel
         g.setColour (on ? b.findColour (TextButton::buttonOnColourId) : sw::colour::line);
         g.drawRoundedRectangle (r, rad, 1.0f);
     }
+    Font getComboBoxFont (ComboBox& cb) override { return sw::mono (jlimit (9.0f, 12.0f, cb.getHeight() * 0.42f)); }
+    void positionComboBoxText (ComboBox& cb, Label& l) override
+    {
+        l.setBounds (8, 0, cb.getWidth() - 26, cb.getHeight());
+        l.setFont (getComboBoxFont (cb));
+        l.setMinimumHorizontalScale (1.0f);
+    }
     void drawComboBox (Graphics& g, int w, int h, bool, int, int, int, int, ComboBox& cb) override
     {
         auto r = Rectangle<float> (0, 0, (float) w, (float) h).reduced (0.5f);
         g.setColour (cb.isMouseOver (true) ? sw::colour::subtle : sw::colour::card); g.fillRoundedRectangle (r, jmin (10.0f, r.getHeight() / 2));
         g.setColour (sw::colour::line); g.drawRoundedRectangle (r, jmin (10.0f, r.getHeight() / 2), 1.0f);
-        const float sp = 2.6f, d = 1.9f, cx = w - 16.0f, cy = h / 2.0f - sp * 0.5f;
+        const float sp = 2.2f, d = 1.6f, cx = w - 13.0f, cy = h / 2.0f - sp * 0.5f;
         g.setColour (sw::colour::text);
         for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
             g.fillRoundedRectangle (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d, d * 0.28f);
@@ -2903,8 +2921,8 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
     void resized() override
     {
         auto r = getLocalBounds();
-        top.setBounds (r.removeFromTop (TopBar::rowH + 52));
-        menu.setBounds (0, 0, 560, TopBar::rowH);
+        top.setBounds (r.removeFromTop (TopBar::rowH + 36));
+        menu.setBounds (0, 0, 520, TopBar::rowH);
         menu.toFront (false);
         if (browser.isVisible()) browser.setBounds (r.removeFromLeft (290));
         if (detail.isVisible()) detail.setBounds (r.removeFromBottom (jmin (330, r.getHeight() / 2)));
