@@ -145,6 +145,7 @@ struct Session
         edit = f.existsAsFile() ? te::loadEditFromFile (engine, f) : te::createEmptyEdit (engine, f);
         if (! f.existsAsFile()) edit->ensureNumberOfAudioTracks (4);
         prepareSlots();
+        ensureAudioDevice();
         edit->getTransport().ensureContextAllocated();
         settings().setValue ("lastProject", f.getFullPathName()); settings().saveIfNeeded();
         changed(); if (onSelect) onSelect();
@@ -292,6 +293,14 @@ struct Session
     {
         auto& tc = edit->getTransport();
         if (tc.isRecording()) { tc.stop (false, false); changed(); return; }
+        ensureAudioDevice();
+        if (engine.getDeviceManager().deviceManager.getCurrentAudioDevice() == nullptr)
+        {
+            AlertWindow::showMessageBoxAsync (MessageBoxIconType::NoIcon, "GRABAR", String::fromUTF8 (
+                "No hay ninguna tarjeta de sonido abierta.\n\nEn SETTINGS > AUDIO elige \"Windows Audio\" (o ASIO si tu interfaz lo tiene) "
+                "y selecciona tu salida y tu entrada. El modo \"Exclusive\" falla si otro programa está usando el audio."));
+            return;
+        }
         if (! anyArmed())
             if (auto t = selTrack && returnBus (*selTrack) < 0 ? selTrack.get() : regularTracks().getFirst()) arm (*t, true);
         if (! anyArmed())
@@ -303,6 +312,21 @@ struct Session
         }
         tc.record (false, false);
         changed();
+    }
+
+    // If no sound card is open (e.g. WASAPI exclusive failed because another app holds it), fall back to the
+    // shared "Windows Audio" driver with the default devices.
+    void ensureAudioDevice()
+    {
+        auto& dm = engine.getDeviceManager().deviceManager;
+        if (dm.getCurrentAudioDevice() != nullptr) return;
+       #if JUCE_WINDOWS
+        dm.setCurrentAudioDeviceType ("Windows Audio", true);
+       #endif
+        if (dm.getCurrentAudioDevice() == nullptr)
+            dm.initialiseWithDefaultDevices (2, 2);
+        Logger::writeToLog ("audio device: " + (dm.getCurrentAudioDevice() ? dm.getCurrentAudioDevice()->getName() : String ("none")));
+        if (edit) edit->getTransport().ensureContextAllocated (true);
     }
 
     // If the sound card has inputs but none are open, open the first two so there is something to record.
@@ -741,7 +765,7 @@ struct Waveforms
 
 //==============================================================================
 // I/O row: one per track, on the right of the TIMELINE (input, monitor, arm, volume, pan, output)
-struct IORow : Component
+struct IORow : Component, Timer
 {
     IORow (Session& s, te::AudioTrack& t) : session (s), track (&t)
     {
@@ -788,7 +812,12 @@ struct IORow : Component
         monitor[0]->setTooltip ("Escuchar siempre la entrada"); monitor[1]->setTooltip ("Escuchar la entrada solo al armar"); monitor[2]->setTooltip ("No escuchar la entrada");
         for (auto* c : { (Component*) &input, (Component*) &arm }) addAndMakeVisible (c);
         refresh();
+        meter = session.engine.getDeviceManager().deviceManager.getInputLevelGetter();
+        startTimerHz (20);
     }
+    // ponytail: one meter for the sound card's inputs (not per channel); enough to see that signal arrives
+    void timerCallback() override { if (arm.getToggleState()) repaint (meterArea()); }
+    Rectangle<int> meterArea() const { return arm.getBounds().translated (-58, 0).withWidth (52).reduced (0, 7); }
 
     void refresh()
     {
@@ -815,6 +844,17 @@ struct IORow : Component
         g.drawText ("OUT > MAIN", out, Justification::centredLeft);
         g.setColour (sw::colour::text); g.setFont (sw::mono (10.0f));
         g.drawText (String (volume.getValue(), 1) + " dB", out, Justification::centredRight);
+        if (arm.getToggleState() && meter != nullptr)   // input level as a row of dots, red near the top
+        {
+            auto m = meterArea().toFloat();
+            const double lvl = jlimit (0.0, 1.0, std::sqrt (meter->getCurrentLevel()) * 1.4);
+            for (int i = 0; i < 10; ++i)
+            {
+                const bool lit = i < (int) std::round (lvl * 10);
+                g.setColour (lit ? (i >= 8 ? sw::colour::accent : sw::colour::text) : sw::colour::line);
+                g.fillEllipse (m.getX() + i * 5.2f, m.getCentreY() - 1.6f, 3.2f, 3.2f);
+            }
+        }
     }
     Rectangle<int> outArea() const { return getLocalBounds().reduced (14, 10).removeFromBottom (14).withTrimmedLeft (getWidth() / 2); }
 
@@ -836,6 +876,7 @@ struct IORow : Component
     }
 
     Session& session; te::AudioTrack::Ptr track;
+    AudioDeviceManager::LevelMeter::Ptr meter;
     ComboBox input; Pill arm { "o" };
     OwnedArray<Pill> monitor;
     Slider volume, pan;
@@ -2446,6 +2487,42 @@ struct TopBar : Component, Timer
 //==============================================================================
 struct AppLook : sw::LookAndFeel
 {
+    // Dot glyphs for the browser (option A): red outline folder, black page with a wave
+    static Image dots (std::initializer_list<const char*> rows, Colour c, float h)
+    {
+        const int nr = (int) rows.size(), nc = (int) strlen (*rows.begin());
+        const float s = h / nr;
+        Image img (Image::ARGB, roundToInt (nc * s * 2), roundToInt (h * 2), true);
+        Graphics g (img); g.addTransform (AffineTransform::scale (2.0f)); g.setColour (c);
+        int j = 0;
+        for (auto* r : rows) { for (int i = 0; r[i]; ++i) if (r[i] == '1') g.fillEllipse (i * s + s * 0.08f, j * s + s * 0.08f, s * 0.84f, s * 0.84f); ++j; }
+        return img;
+    }
+    static Image folderIcon (Colour c) { return dots ({ "1111.....", "1..111111", "1.......1", "1.......1", "1.......1", "1.......1", "111111111" }, c, 15); }
+    static Image fileIcon (Colour c)   { return dots ({ "11111..", "1...11.", "1....11", "1..1..1", "1.111.1", "1..1..1", "1111111" }, c, 15); }
+
+    void drawFileBrowserRow (Graphics& g, int w, int h, const File&, const String& name, Image*, const String&, const String&,
+                             bool isDir, bool selected, int, DirectoryContentsDisplayComponent&) override
+    {
+        if (selected) { g.setColour (sw::colour::text); g.fillRoundedRectangle (0, 1, (float) w, (float) h - 2, 6.0f); }
+        auto icon = isDir ? folderIcon (selected ? sw::colour::card : sw::colour::accent) : fileIcon (selected ? sw::colour::card : sw::colour::text);
+        const float iw = icon.getWidth() / 2.0f, ih = icon.getHeight() / 2.0f;
+        g.drawImage (icon, Rectangle<float> (4, (h - ih) / 2, iw, ih));
+        g.setColour (selected ? sw::colour::card : sw::colour::text);
+        g.setFont (sw::mono (12.0f));
+        g.drawText (name, roundToInt (iw) + 12, 0, w - roundToInt (iw) - 14, h, Justification::centredLeft, true);
+    }
+    void drawTreeviewPlusMinusBox (Graphics& g, const Rectangle<float>& area, Colour, bool isOpen, bool) override
+    {
+        auto c = area.getCentre();
+        g.setColour (sw::colour::text);
+        const char* right[] { "1....", "11...", "111..", "11...", "1...." };
+        const char* down[]  { ".....", "11111", ".111.", "..1..", "....." };
+        auto** rows = isOpen ? down : right;
+        for (int j = 0; j < 5; ++j) for (int i = 0; i < 5; ++i)
+            if (rows[j][i] == '1') g.fillEllipse (c.x - 6 + i * 2.6f, c.y - 6 + j * 2.6f, 1.8f, 1.8f);
+    }
+
     Font getMenuBarFont (MenuBarComponent&, int, const String&) override { return sw::label (11.0f); }
     void drawMenuBarBackground (Graphics& g, int, int, bool, MenuBarComponent&) override { g.fillAll (sw::colour::card); }
     void drawMenuBarItem (Graphics& g, int w, int h, int, const String& text, bool over, bool open, bool, MenuBarComponent& bar) override
