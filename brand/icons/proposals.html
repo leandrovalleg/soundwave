@@ -1,0 +1,66 @@
+<html><head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@900&family=Space+Mono&display=swap"></head>
+<body style="margin:0;background:#EFEFEF;font-family:'Space Mono',monospace;padding:14px 18px">
+<script>
+const R='#D71921', K='#111111';
+const G={
+ play:["1......","11.....","1111...","1111111","1111...","11.....","1......"].map(r=>r),
+ stop:["1111111","1111111","1111111","1111111","1111111","1111111","1111111"],
+ rec:["..111..",".11111.","1111111","1111111","1111111",".11111.","..111.."],
+ loop:["..1....",".111111","1.1...1","1.....1","1...1.1","111111.","....1.."],
+ browser:["1111111","11....1","11....1","11....1","11....1","11....1","1111111"],
+ panel:["1111111","1.....1","1.....1","1111111","1111111","1111111","1111111"],
+ timeline:["1111...",".......","..11111",".......","111....",".......","...1111"],
+ grid:["111.111","111.111","111.111",".......","111.111","111.111","111.111"],
+ plus:["...1...","...1...","...1...","1111111","...1...","...1...","...1..."],
+ gear:["1..1..1",".11111.",".1...1.","11...11",".1...1.",".11111.","1..1..1"],
+ exportUp:["...1...","..111..",".1.1.1.","...1...","...1...","1.....1","1111111"],
+ chev:[".......",".......","1.....1",".1...1.","..1.1..","...1...","......."],
+ dots3:["...1...",".......",".......","...1...",".......",".......","...1..."],
+};
+function glyph(name,col,px=14){ const c=document.createElement('canvas'); c.width=c.height=px*2; c.style.width=c.style.height=px+'px';
+  const x=c.getContext('2d'); x.scale(2,2); const s=px/7; x.fillStyle=col;
+  G[name].forEach((row,j)=>[...row].forEach((ch,i)=>{ if(ch!=='1')return; const r=s*0.37; x.beginPath(); x.roundRect(i*s+s/2-r,j*s+s/2-r,2*r,2*r,r*0.55); x.fill(); })); return c; }
+function el(html,css){ const d=document.createElement('div'); d.style.cssText=css||''; if(html) d.innerHTML=html; return d; }
+function btn(label,g,col,opt={}){
+  const on=opt.on; const b=el('', `display:inline-flex;align-items:center;gap:7px;height:24px;padding:0 ${label?10:0}px;${label?'':'width:24px;justify-content:center;'}border:1px solid ${on?'#E4E4E4':'#DADADA'};background:${on?'#E4E4E4':'#fff'};border-radius:${opt.round?'50%':'8px'};font-size:9px;letter-spacing:.12em;box-sizing:border-box;color:#111`);
+  if(g) b.appendChild(glyph(g,col)); if(label) b.appendChild(el(label)); return b; }
+function metroDots(col){ return el(`<span style="display:inline-block;width:6px;height:6px;border-radius:1.6px;background:${col}"></span> <span style="display:inline-block;width:6px;height:6px;border-radius:1.6px;background:${col};opacity:.3"></span>`,'display:inline-flex;gap:3px;align-items:center'); }
+function clickPill(col, variant){
+  // variants: 'circle' (actual), 'split', 'inside', 'square', 'kebab'
+  const wrap=el('','display:inline-flex;align-items:center;gap:4px');
+  if(variant==='split'){
+    const b=el('','display:inline-flex;align-items:stretch;height:24px;border:1px solid #DADADA;border-radius:8px;overflow:hidden;background:#fff');
+    const a=el('','display:flex;align-items:center;gap:7px;padding:0 10px;font-size:9px;letter-spacing:.12em'); a.appendChild(metroDots(col)); a.appendChild(el('CLICK'));
+    const s=el('','display:flex;align-items:center;justify-content:center;width:20px;border-left:1px solid #DADADA'); s.appendChild(glyph('chev',K,11));
+    b.appendChild(a); b.appendChild(s); wrap.appendChild(b); return wrap; }
+  const b=el('','display:inline-flex;align-items:center;gap:7px;height:24px;padding:0 10px;border:1px solid #DADADA;border-radius:8px;background:#fff;font-size:9px;letter-spacing:.12em');
+  b.appendChild(metroDots(col)); b.appendChild(el('CLICK'));
+  if(variant==='inside') b.appendChild(glyph('chev',K,10));
+  if(variant==='kebab') b.appendChild(glyph('dots3',K,11));
+  wrap.appendChild(b);
+  if(variant==='circle') wrap.appendChild(btn('','chev',K,{round:1}));
+  if(variant==='square') wrap.appendChild(btn('','chev',K,{}));
+  return wrap; }
+function bar(title, reds, clickVariant){
+  const w=el('','background:#fff;border:1px solid #DADADA;border-radius:12px;padding:8px 12px;margin-bottom:8px');
+  w.appendChild(el(title,'font-family:Doto;font-size:14px;margin-bottom:6px'));
+  const r1=el('','display:flex;gap:4px;margin-bottom:5px;justify-content:flex-end');
+  [['BROWSER','browser',1],['PANEL','panel',1],['TIMELINE','timeline',1],['GRID','grid',0],['TRACK','plus',0],['EXPORT','exportUp',0],['SETTINGS','gear',0]]
+   .forEach(([l,g,on])=>r1.appendChild(btn(l,g,reds.includes(g)?R:K,{on})));
+  const r2=el('','display:flex;gap:4px;align-items:center');
+  r2.appendChild(el('SOUNDWAVE','font-family:Doto;font-size:14px;width:96px'));
+  r2.appendChild(btn('TAP',null,K)); r2.appendChild(el('120.00 <span style="font-size:7px;color:#8a8a8a">BPM</span>','height:24px;display:flex;align-items:center;padding:0 9px;border:1px solid #DADADA;border-radius:8px;font-family:Doto;font-size:13px'));
+  r2.appendChild(clickPill(reds.includes('click')?R:K, clickVariant));
+  [['PLAY','play'],['STOP','stop'],['REC','rec'],['LOOP','loop']].forEach(([l,g])=>r2.appendChild(btn(l,g,reds.includes(g)?R:K)));
+  w.appendChild(r1); w.appendChild(r2); document.body.appendChild(w); }
+document.body.appendChild(el('DÓNDE PONER MÁS ROJO','font-size:10px;letter-spacing:.16em;color:#8a8a8a;margin:2px 0 8px'));
+bar('R1  TRANSPORTE: PLAY + REC',          ['play','rec'], 'split');
+bar('R2  CREAR / SACAR: TRACK + EXPORT + REC', ['plus','exportUp','rec'], 'split');
+bar('R3  RITMO: CLICK + LOOP + REC',        ['click','loop','rec'], 'split');
+bar('R4  VISTAS EN ROJO + REC',              ['browser','panel','timeline','grid','rec'], 'split');
+document.body.appendChild(el('OPCIONES DEL METRÓNOMO','font-size:10px;letter-spacing:.16em;color:#8a8a8a;margin:12px 0 8px'));
+const m=el('','display:grid;grid-template-columns:repeat(5,1fr);gap:8px');
+[['ACTUAL · CÍRCULO','circle'],['M1 · BOTÓN PARTIDO','split'],['M2 · FLECHA DENTRO','inside'],['M3 · CUADRADO','square'],['M4 · TRES PUNTOS','kebab']]
+ .forEach(([t,v])=>{ const c=el('','background:#fff;border:1px solid #DADADA;border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px;align-items:center'); c.appendChild(clickPill(K,v)); c.appendChild(el(t,'font-size:8.5px;letter-spacing:.1em')); m.appendChild(c); });
+document.body.appendChild(m);
+</script></body></html>
