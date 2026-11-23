@@ -230,6 +230,24 @@ struct Session
         });
     }
 
+    // ---- plugin copy / paste / move (a copy keeps all the plugin's settings)
+    ValueTree pluginClipboard;
+    te::Plugin* insertPluginCopy (te::AudioTrack& t, const ValueTree& source, int index)
+    {
+        auto v = source.createCopy();
+        te::EditItemID::remapIDs (v, nullptr, [this] { return edit->createNewItemID(); });
+        auto p = t.pluginList.insertPlugin (v, jlimit (0, firstSendIndex (t), index));
+        if (p && p->isSynth()) routeMidiTo (t);
+        changed();
+        return p.get();
+    }
+    void movePluginTo (te::Plugin& p, te::AudioTrack& target)
+    {
+        auto state = p.state.createCopy();
+        p.deleteFromParent();
+        insertPluginCopy (target, state, firstSendIndex (target));
+    }
+
     // Instruments go first in the chain and get the MIDI keyboard; effects go before the volume.
     void insertPlugin (te::AudioTrack& t, const PluginDescription& d)
     {
@@ -2034,6 +2052,124 @@ struct AudioClipEditor : Component, ChangeListener
     bool loading = false;
 };
 
+// Button with a 7x7 dot glyph before its label. Dots are soft squares in three tones:
+// '1' main (black), '2' secondary (translucent grey), '3' detail (red). Corners 10 px; icon-only buttons are circles.
+// Pressed look depends on the job: views go light grey, transport goes soft red, REC goes solid red.
+struct DotButton : TextButton, Timer
+{
+    // 8-bit hover: the glyph is redrawn column by column, a red column sweeping left to right in steps
+    int animStep = -1;   // -1 idle, 0..7 sweeping
+    // Optional options arrow inside the button (right edge): click it, or right-click anywhere, to open the menu
+    std::function<void()> onMenu;
+    static constexpr int menuW = 16;
+    void mouseDown (const MouseEvent& e) override
+    {
+        if (onMenu && (e.mods.isPopupMenu() || e.x > getWidth() - menuW)) { onMenu(); return; }
+        TextButton::mouseDown (e);
+    }
+    void mouseEnter (const MouseEvent& e) override { TextButton::mouseEnter (e); animStep = 0; startTimer (38); repaint(); }
+    void timerCallback() override { if (++animStep > 7) { animStep = -1; stopTimer(); } repaint(); }
+
+    enum Glyph { none, play, stop, rec, loop, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro, power, window, arrowL, arrowR, dup, cross };
+    enum class OnStyle { grey, redSoft, redSolid };
+    int beatLight = 0;   // metro: 0 idle, 1 first beat of the bar, 2 other beats
+    OnStyle onStyle = OnStyle::grey;
+    DotButton (const String& label, Glyph g, const String& tip) : TextButton (label), glyph (g) { setTooltip (tip); setWantsKeyboardFocus (false); }
+
+    static const char* rows (Glyph g)
+    {
+        switch (g)
+        {
+            case play     : return "1......121....12221..122222312221..121....1......";
+            case stop     : return "1111111122222112222211222221122222112222211111111";
+            case rec      : return "..111...13331.133333113333311333331.13331...111..";
+            case loop     : return "..3.....3111111.3...11.....11...3.1111113.....3..";
+            case browser  : return "111111112....112....112....112....112....11111111";
+            case panel    : return "11111111.....11.....11111111122222112222211111111";
+            case timeline : return "1111............33333.......111..............2222";
+            case grid     : return "111.333111.333111.333.......222.111222.111222.111";
+            case plus     : return "...1......1......1...1113111...1......1......1...";
+            case gear     : return "2..1..2.11111..1...1.11.3.11.1...1..11111.2..1..2";
+            case exportUp : return "...3.....333...3.3.3....3......1...1.....11111111";
+            case chevron  : return "..............1.....1.1...1...1.1.....3..........";
+            case metro    : return ".................................................";   // drawn by hand below
+            case power    : return "...1....1.1.1.1..1..11.....11.....1.1...1...111..";
+            case window   : return "111111111111111.....11.....11.....11.....11111111";
+            case arrowL   : return "...1.....1.....1.....1111111.1.......1.......1...";
+            case arrowR   : return "...1.......1.......1.1111111.....1.....1.....1...";
+            case dup      : return "1111...1..1...1..11111111..1...1..1...1..1...1111";
+            case cross    : return "1.....1.1...1...1.1.....1.....1.1...1...1.1.....1";
+            default:       return nullptr;
+        }
+    }
+
+    void paintButton (Graphics& g, bool over, bool) override
+    {
+        namespace C = sw::colour;   // ('text' alone would be Button::text here)
+        const bool on = getToggleState();
+        const bool iconOnly = getButtonText().isEmpty();
+        Colour bg = over ? C::subtle : C::card, border = C::line, txt = C::text, main = C::text,
+               second = C::text.withAlpha (0.32f), detail = C::accent;
+        if (on)
+        {
+            switch (onStyle)
+            {
+                case OnStyle::grey:     bg = Colour (0xffe4e4e4); border = bg; break;
+                case OnStyle::redSoft:  bg = C::accent.withAlpha (0.09f); border = C::accent.withAlpha (0.35f);
+                                        txt = main = detail = C::accent; second = C::accent.withAlpha (0.35f); break;
+                case OnStyle::redSolid: bg = border = C::accent; txt = main = detail = C::card; second = C::card.withAlpha (0.5f); break;
+            }
+        }
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        const float rad = iconOnly ? r.getHeight() / 2 : jmin (10.0f, r.getHeight() / 2);
+        g.setColour (bg); g.fillRoundedRectangle (r, rad);
+        g.setColour (border); g.drawRoundedRectangle (r, rad, 1.0f);
+
+        const auto font = sw::label (jlimit (8.0f, 10.0f, getHeight() * 0.38f));
+        const float textW = iconOnly ? 0.0f : (float) GlyphArrangement::getStringWidth (font, getButtonText());
+        const float step = jlimit (1.5f, 2.5f, getHeight() / (iconOnly ? 10.0f : 12.0f)), dot = step * 0.74f;
+        const float glyphW = rows (glyph) ? step * 7 + (iconOnly ? 0.0f : 7.0f) : 0;
+        const float contentW = (float) getWidth() - (onMenu ? menuW : 0);
+        float x = contentW / 2.0f - (glyphW + textW) / 2;
+        if (onMenu)   // compact V of five dots at the right edge
+        {
+            const float sp = 2.0f, d = 1.5f, cx = getWidth() - menuW / 2.0f - 2, cy = getHeight() / 2.0f - sp * 0.5f;
+            g.setColour (txt.withAlpha (0.8f));
+            for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
+                g.fillRoundedRectangle (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d, d * 0.28f);
+        }
+        auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * 0.28f); };
+        if (auto* bits = rows (glyph))
+        {
+            const float y0 = getHeight() / 2.0f - step * 3.5f;
+            // one colour per icon: REC is red, the rest take the button's ink (black, red or white when pressed)
+            const Colour ink = (glyph == rec || glyph == cross) && ! on ? C::accent : main;
+            for (int i = 0; i < 49 && bits[i]; ++i)
+            {
+                if (bits[i] == '.') continue;
+                const int column = i % 7;
+                if (animStep >= 0 && column > animStep) continue;        // 8-bit hover: drawn column by column
+                g.setColour (animStep >= 0 && column == animStep ? ink.withAlpha (0.45f) : ink);
+                square (x + (i % 7) * step, y0 + (i / 7) * step, dot);
+            }
+            if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
+            {
+                const float d = step * 2.4f, cy = getHeight() / 2.0f;
+                // both dots share one colour: red on beat 1, black otherwise; the dot for the current beat is full, the other faint
+                const Colour ink = beatLight == 1 ? (on ? main : C::accent) : main;
+                const bool hideR = animStep >= 0 && animStep < 4;
+                g.setColour (beatLight == 2 ? ink.withAlpha (0.3f) : ink);
+                square (x + step * 0.2f, cy - d / 2, d);
+                if (! hideR) { g.setColour (beatLight == 1 ? ink.withAlpha (0.3f) : ink); square (x + step * 4.0f, cy - d / 2, d); }
+            }
+            x += glyphW;
+        }
+        g.setColour (txt); g.setFont (font);
+        g.drawText (getButtonText(), Rectangle<float> (x, 0, textW + 2, (float) getHeight()), Justification::centredLeft);
+    }
+    Glyph glyph;
+};
+
 //==============================================================================
 // DEVICES: the selected track's chain. Each card: on/off, open, move, remove, and its first parameters as knobs.
 struct DeviceChain : Component
@@ -2042,12 +2178,13 @@ struct DeviceChain : Component
     {
         Card (Session& s, te::AudioTrack& t, te::Plugin& p) : session (s), track (&t), plugin (&p)
         {
-            for (auto* b : { &power, &open, &left, &right, &del }) addAndMakeVisible (b);
+            for (auto* b : { &power, &open, &left, &right, &dup, &del }) addAndMakeVisible (b);
             power.setClickingTogglesState (true);
             power.setToggleState (p.isEnabled(), dontSendNotification);
             power.onClick = [this] { plugin->setEnabled (power.getToggleState()); repaint(); };
             open.onClick = [this] { plugin->showWindowExplicitly(); };
-            del.onClick = [this] { auto& sess = session; plugin->deleteFromParent(); sess.changed(); };
+            del.onClick = [this] { remove(); };
+            dup.onClick = [this] { duplicate(); };
             left.onClick = [this] { move (-1); }; right.onClick = [this] { move (1); };
             auto params = p.getAutomatableParameters();
             for (int i = 0; i < jmin (8, params.size()); ++i)
@@ -2064,6 +2201,37 @@ struct DeviceChain : Component
                 addAndMakeVisible (l);
             }
         }
+        void remove() { auto& sess = session; plugin->deleteFromParent(); sess.changed(); }
+        void duplicate() { session.insertPluginCopy (*track, plugin->state, track->pluginList.indexOf (plugin.get()) + 1); }
+
+        // right-click: duplicate, copy, paste after, move to another track, move, delete
+        void mouseDown (const MouseEvent& e) override
+        {
+            if (! e.mods.isPopupMenu()) return;
+            PopupMenu m, to;
+            auto others = session.orderedTracks();
+            for (int i = 0; i < others.size(); ++i)
+                if (others[i] != track.get()) to.addItem (100 + i, others[i]->getName());
+            m.addItem (1, "Duplicar");
+            m.addItem (2, "Copiar");
+            m.addItem (3, String::fromUTF8 ("Pegar después"), session.pluginClipboard.isValid());
+            m.addSubMenu ("Mover a pista", to);
+            m.addSeparator();
+            m.addItem (4, "Mover a la izquierda"); m.addItem (5, "Mover a la derecha");
+            m.addSeparator();
+            m.addItem (6, "Borrar");
+            m.showMenuAsync ({}, [this, others] (int r)
+            {
+                if (r == 1) duplicate();
+                else if (r == 2) session.pluginClipboard = plugin->state.createCopy();
+                else if (r == 3) session.insertPluginCopy (*track, session.pluginClipboard, track->pluginList.indexOf (plugin.get()) + 1);
+                else if (r == 4) move (-1);
+                else if (r == 5) move (1);
+                else if (r == 6) remove();
+                else if (r >= 100) session.movePluginTo (*plugin, *others[r - 100]);
+            });
+        }
+
         void move (int dir)
         {
             auto parent = plugin->state.getParent();
@@ -2090,12 +2258,14 @@ struct DeviceChain : Component
         {
             auto r = getLocalBounds().reduced (14, 10);
             r.removeFromTop (36);
-            auto bar = r.removeFromBottom (22);
-            power.setBounds (bar.removeFromLeft (40)); bar.removeFromLeft (3);
-            open.setBounds (bar.removeFromLeft (50)); bar.removeFromLeft (3);
-            del.setBounds (bar.removeFromRight (26)); bar.removeFromRight (3);
-            right.setBounds (bar.removeFromRight (26)); bar.removeFromRight (3);
-            left.setBounds (bar.removeFromRight (26));
+            auto bar = r.removeFromBottom (24);   // [power][open]   [<][>]   [duplicate][delete]
+            const int b = bar.getHeight();
+            power.setBounds (bar.removeFromLeft (b)); bar.removeFromLeft (4);
+            open.setBounds (bar.removeFromLeft (b));
+            del.setBounds (bar.removeFromRight (b)); bar.removeFromRight (4);
+            dup.setBounds (bar.removeFromRight (b));
+            auto mid = bar.withSizeKeepingCentre (b * 2 + 4, b);
+            left.setBounds (mid.removeFromLeft (b)); right.setBounds (mid.removeFromRight (b));
             r.removeFromBottom (6);
             const int cols = 4, cw = r.getWidth() / cols, ch = jmin (64, r.getHeight() / 2);
             for (int i = 0; i < knobs.size(); ++i)
@@ -2106,7 +2276,9 @@ struct DeviceChain : Component
             }
         }
         Session& session; te::AudioTrack::Ptr track; te::Plugin::Ptr plugin;
-        Pill power { "ON" }, open { "OPEN" }, left { "<" }, right { ">" }, del { "X" };
+        DotButton power { "", DotButton::power, "Encender / apagar" }, open { "", DotButton::window, "Abrir ventana del plugin" },
+                  left { "", DotButton::arrowL, "Mover a la izquierda" }, right { "", DotButton::arrowR, "Mover a la derecha" },
+                  dup { "", DotButton::dup, "Duplicar (clic derecho: copiar, pegar, mover a otra pista)" }, del { "", DotButton::cross, "Borrar" };
         OwnedArray<Slider> knobs; OwnedArray<Label> names;
     };
 
@@ -2115,6 +2287,11 @@ struct DeviceChain : Component
         addAndMakeVisible (viewport); viewport.setViewedComponent (&content, false);
         viewport.setScrollBarsShown (false, true);
         add.onClick = [this] { if (session.selTrack) session.choosePluginFor (*session.selTrack); };
+        add.setTooltip (String::fromUTF8 ("Añadir plugin (clic derecho en una tarjeta: copiar / pegar)"));
+        paste.setTooltip ("Pegar el plugin copiado al final de la cadena");
+        paste.onClick = [this] { if (session.selTrack && session.pluginClipboard.isValid())
+                                     session.insertPluginCopy (*session.selTrack, session.pluginClipboard, Session::firstSendIndex (*session.selTrack)); };
+        content.addAndMakeVisible (paste);
         content.addAndMakeVisible (add);
     }
     void rebuild()
@@ -2123,6 +2300,7 @@ struct DeviceChain : Component
         if (auto t = session.selTrack)
             for (auto p : Session::userPlugins (*t)) content.addAndMakeVisible (cards.add (new Card (session, *t, *p)));
         add.setVisible (session.selTrack != nullptr);
+        paste.setVisible (session.selTrack != nullptr && session.pluginClipboard.isValid());
         resized(); repaint();
     }
     void paint (Graphics& g) override
@@ -2139,12 +2317,13 @@ struct DeviceChain : Component
         int x = 0;
         for (auto* c : cards) { c->setBounds (x, 0, w, h); x += w + 6; }
         add.setBounds (x + 6, h / 2 - 16, 90, 32);
+        paste.setBounds (x + 6, h / 2 + 22, 90, 26);
         content.setSize (x + 110, h);
     }
     Session& session;
     Viewport viewport; Component content;
     OwnedArray<Card> cards;
-    Pill add { "+ ADD" };
+    Pill add { "+ ADD" }, paste { "PASTE" };
 };
 
 //==============================================================================
@@ -2423,117 +2602,7 @@ struct BpmBox : Component
 
 //==============================================================================
 // TOP BAR: views | tempo & timing | transport | loop | key | CPU | project
-// Button with a 7x7 dot glyph before its label. Dots are soft squares in three tones:
-// '1' main (black), '2' secondary (translucent grey), '3' detail (red). Corners 10 px; icon-only buttons are circles.
-// Pressed look depends on the job: views go light grey, transport goes soft red, REC goes solid red.
-struct DotButton : TextButton, Timer
-{
-    // 8-bit hover: the glyph is redrawn column by column, a red column sweeping left to right in steps
-    int animStep = -1;   // -1 idle, 0..7 sweeping
-    // Optional options arrow inside the button (right edge): click it, or right-click anywhere, to open the menu
-    std::function<void()> onMenu;
-    static constexpr int menuW = 16;
-    void mouseDown (const MouseEvent& e) override
-    {
-        if (onMenu && (e.mods.isPopupMenu() || e.x > getWidth() - menuW)) { onMenu(); return; }
-        TextButton::mouseDown (e);
-    }
-    void mouseEnter (const MouseEvent& e) override { TextButton::mouseEnter (e); animStep = 0; startTimer (38); repaint(); }
-    void timerCallback() override { if (++animStep > 7) { animStep = -1; stopTimer(); } repaint(); }
 
-    enum Glyph { none, play, stop, rec, loop, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro };
-    enum class OnStyle { grey, redSoft, redSolid };
-    int beatLight = 0;   // metro: 0 idle, 1 first beat of the bar, 2 other beats
-    OnStyle onStyle = OnStyle::grey;
-    DotButton (const String& label, Glyph g, const String& tip) : TextButton (label), glyph (g) { setTooltip (tip); setWantsKeyboardFocus (false); }
-
-    static const char* rows (Glyph g)
-    {
-        switch (g)
-        {
-            case play     : return "1......121....12221..122222312221..121....1......";
-            case stop     : return "1111111122222112222211222221122222112222211111111";
-            case rec      : return "..111...13331.133333113333311333331.13331...111..";
-            case loop     : return "..3.....3111111.3...11.....11...3.1111113.....3..";
-            case browser  : return "111111112....112....112....112....112....11111111";
-            case panel    : return "11111111.....11.....11111111122222112222211111111";
-            case timeline : return "1111............33333.......111..............2222";
-            case grid     : return "111.333111.333111.333.......222.111222.111222.111";
-            case plus     : return "...1......1......1...1113111...1......1......1...";
-            case gear     : return "2..1..2.11111..1...1.11.3.11.1...1..11111.2..1..2";
-            case exportUp : return "...3.....333...3.3.3....3......1...1.....11111111";
-            case chevron  : return "..............1.....1.1...1...1.1.....3..........";
-            case metro    : return ".................................................";   // drawn by hand below
-            default:       return nullptr;
-        }
-    }
-
-    void paintButton (Graphics& g, bool over, bool) override
-    {
-        namespace C = sw::colour;   // ('text' alone would be Button::text here)
-        const bool on = getToggleState();
-        const bool iconOnly = getButtonText().isEmpty();
-        Colour bg = over ? C::subtle : C::card, border = C::line, txt = C::text, main = C::text,
-               second = C::text.withAlpha (0.32f), detail = C::accent;
-        if (on)
-        {
-            switch (onStyle)
-            {
-                case OnStyle::grey:     bg = Colour (0xffe4e4e4); border = bg; break;
-                case OnStyle::redSoft:  bg = C::accent.withAlpha (0.09f); border = C::accent.withAlpha (0.35f);
-                                        txt = main = detail = C::accent; second = C::accent.withAlpha (0.35f); break;
-                case OnStyle::redSolid: bg = border = C::accent; txt = main = detail = C::card; second = C::card.withAlpha (0.5f); break;
-            }
-        }
-        auto r = getLocalBounds().toFloat().reduced (0.5f);
-        const float rad = iconOnly ? r.getHeight() / 2 : jmin (10.0f, r.getHeight() / 2);
-        g.setColour (bg); g.fillRoundedRectangle (r, rad);
-        g.setColour (border); g.drawRoundedRectangle (r, rad, 1.0f);
-
-        const auto font = sw::label (jlimit (8.0f, 10.0f, getHeight() * 0.38f));
-        const float textW = iconOnly ? 0.0f : (float) GlyphArrangement::getStringWidth (font, getButtonText());
-        const float step = jlimit (1.5f, 2.5f, getHeight() / (iconOnly ? 10.0f : 12.0f)), dot = step * 0.74f;
-        const float glyphW = rows (glyph) ? step * 7 + (iconOnly ? 0.0f : 7.0f) : 0;
-        const float contentW = (float) getWidth() - (onMenu ? menuW : 0);
-        float x = contentW / 2.0f - (glyphW + textW) / 2;
-        if (onMenu)   // compact V of five dots at the right edge
-        {
-            const float sp = 2.0f, d = 1.5f, cx = getWidth() - menuW / 2.0f - 2, cy = getHeight() / 2.0f - sp * 0.5f;
-            g.setColour (txt.withAlpha (0.8f));
-            for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
-                g.fillRoundedRectangle (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d, d * 0.28f);
-        }
-        auto square = [&] (float px, float py, float d) { g.fillRoundedRectangle (px, py, d, d, d * 0.28f); };
-        if (auto* bits = rows (glyph))
-        {
-            const float y0 = getHeight() / 2.0f - step * 3.5f;
-            // one colour per icon: REC is red, the rest take the button's ink (black, red or white when pressed)
-            const Colour ink = glyph == rec && ! on ? C::accent : main;
-            for (int i = 0; i < 49 && bits[i]; ++i)
-            {
-                if (bits[i] == '.') continue;
-                const int column = i % 7;
-                if (animStep >= 0 && column > animStep) continue;        // 8-bit hover: drawn column by column
-                g.setColour (animStep >= 0 && column == animStep ? ink.withAlpha (0.45f) : ink);
-                square (x + (i % 7) * step, y0 + (i / 7) * step, dot);
-            }
-            if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
-            {
-                const float d = step * 2.4f, cy = getHeight() / 2.0f;
-                // both dots share one colour: red on beat 1, black otherwise; the dot for the current beat is full, the other faint
-                const Colour ink = beatLight == 1 ? (on ? main : C::accent) : main;
-                const bool hideR = animStep >= 0 && animStep < 4;
-                g.setColour (beatLight == 2 ? ink.withAlpha (0.3f) : ink);
-                square (x + step * 0.2f, cy - d / 2, d);
-                if (! hideR) { g.setColour (beatLight == 1 ? ink.withAlpha (0.3f) : ink); square (x + step * 4.0f, cy - d / 2, d); }
-            }
-            x += glyphW;
-        }
-        g.setColour (txt); g.setFont (font);
-        g.drawText (getButtonText(), Rectangle<float> (x, 0, textW + 2, (float) getHeight()), Justification::centredLeft);
-    }
-    Glyph glyph;
-};
 
 
 struct TopBar : Component, Timer
