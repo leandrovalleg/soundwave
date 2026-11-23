@@ -3305,6 +3305,157 @@ struct AppLook : sw::LookAndFeel
     { return GlyphArrangement::getStringWidthInt (getMenuBarFont (bar, i, text), text) + 26; }
 };
 
+static const char* swVersionName = "BETA 0.8";
+
+// Guided tour: dims the window, cuts a hole around the real control and explains it. First launch + AYUDA > Tour.
+struct Tour : Component, Timer
+{
+    struct Step { String title, body; std::function<Rectangle<int>()> target; std::function<void()> before; };
+    std::vector<Step> steps;
+    int index = 0; float phase = 0;
+    Pill back { "ATRAS" }, next { "SIGUIENTE" }, skip { "SALTAR" };
+    std::function<void()> onDone;
+
+    Tour()
+    {
+        back.setButtonText (String::fromUTF8 ("ATRÁS"));
+        for (auto* b : { &back, &next, &skip }) addAndMakeVisible (b);
+        next.setColour (TextButton::buttonColourId, sw::colour::accent);
+        next.setColour (TextButton::textColourOffId, sw::colour::card);
+        back.onClick = [this] { go (index - 1); };
+        next.onClick = [this] { if (index + 1 < (int) steps.size()) go (index + 1); else finish(); };
+        skip.onClick = [this] { finish(); };
+        setWantsKeyboardFocus (true);
+    }
+    void start() { setVisible (true); toFront (true); go (0); startTimerHz (40); grabKeyboardFocus(); }
+    void finish() { stopTimer(); setVisible (false); if (onDone) onDone(); }
+    void go (int i)
+    {
+        index = jlimit (0, (int) steps.size() - 1, i);
+        if (steps[(size_t) index].before) steps[(size_t) index].before();
+        back.setVisible (index > 0);
+        next.setButtonText (index + 1 == (int) steps.size() ? "EMPEZAR" : "SIGUIENTE");
+        resized(); repaint();
+    }
+    Rectangle<int> hole() const { auto& st = steps[(size_t) index]; return st.target ? st.target().expanded (6) : Rectangle<int>(); }
+    Rectangle<int> card() const
+    {
+        const int w = 380, h = 190;
+        auto hl = hole();
+        if (hl.isEmpty()) return getLocalBounds().withSizeKeepingCentre (w + 60, h + 40);
+        Rectangle<int> c;
+        if (hl.getBottom() + 16 + h < getHeight())  c = { hl.getX(), hl.getBottom() + 16, w, h };
+        else if (hl.getY() - 16 - h > 0)          c = { hl.getX(), hl.getY() - 16 - h, w, h };
+        else                                       c = { hl.getRight() + 16, hl.getY(), w, h };
+        return c.constrainedWithin (getLocalBounds().reduced (16));
+    }
+    void timerCallback() override { phase += 0.05f; repaint(); }
+    void paint (Graphics& g) override
+    {
+        auto hl = hole();
+        Path dim; dim.addRectangle (getLocalBounds().toFloat());
+        if (! hl.isEmpty()) { dim.addRoundedRectangle (hl.toFloat(), 14.0f); dim.setUsingNonZeroWinding (false); }
+        g.setColour (Colours::black.withAlpha (0.55f)); g.fillPath (dim);
+        if (! hl.isEmpty())   // pulsing red ring around the control
+        {
+            const float p = 0.5f + 0.5f * std::sin (phase * 3.0f);
+            g.setColour (sw::colour::accent.withAlpha (0.35f + 0.5f * p));
+            g.drawRoundedRectangle (hl.toFloat().expanded (2 + 4 * p), 16.0f, 2.0f);
+        }
+        auto c = card().toFloat();
+        g.setColour (Colours::black.withAlpha (0.18f)); g.fillRoundedRectangle (c.translated (0, 6), 20.0f);
+        g.setColour (sw::colour::card); g.fillRoundedRectangle (c, 20.0f);
+        auto r = c.reduced (22, 18);
+        auto top = r.removeFromTop (14);
+        for (int i = 0; i < (int) steps.size(); ++i)   // progress: one dot per step
+        {
+            g.setColour (i == index ? sw::colour::accent : i < index ? sw::colour::text : sw::colour::line);
+            g.fillRoundedRectangle (top.getX() + i * 11.0f, top.getCentreY() - 3, 7.0f, 6.0f, 2.0f);
+        }
+        g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
+        g.drawText (String (index + 1).paddedLeft ('0', 2) + " / " + String ((int) steps.size()).paddedLeft ('0', 2), top, Justification::centredRight);
+        r.removeFromTop (10);
+        auto& st = steps[(size_t) index];
+        g.setColour (sw::colour::text); g.setFont (sw::display (22.0f));
+        g.drawText (st.title, r.removeFromTop (30), Justification::centredLeft);
+        r.removeFromTop (6);
+        g.setColour (sw::colour::text2); g.setFont (sw::mono (13.5f));
+        g.drawFittedText (st.body, r.removeFromTop (78).toNearestInt(), Justification::topLeft, 5, 1.0f);
+    }
+    void resized() override
+    {
+        if (steps.empty()) return;
+        auto r = card().reduced (22, 16).removeFromBottom (28);
+        next.setBounds (r.removeFromRight (110)); r.removeFromRight (6);
+        back.setBounds (r.removeFromRight (80));
+        skip.setBounds (r.removeFromLeft (80));
+    }
+    void mouseDown (const MouseEvent&) override {}   // the tour blocks clicks behind it
+    bool keyPressed (const KeyPress& k) override
+    {
+        if (k == KeyPress::escapeKey) finish();
+        else if (k == KeyPress::rightKey || k == KeyPress::returnKey) next.triggerClick();
+        else if (k == KeyPress::leftKey && index > 0) go (index - 1);
+        return true;
+    }
+};
+
+// Startup screen: dot-matrix wave, name, version, loading bar
+struct Splash : Component, Timer
+{
+    float t = 0, alpha = 1; bool closing = false; std::function<void()> onGone;
+    Splash()
+    {
+        setOpaque (false);
+        setSize (560, 330);
+        addToDesktop (ComponentPeer::windowIsSemiTransparent | ComponentPeer::windowAppearsOnTaskbar);
+        centreWithSize (getWidth(), getHeight());
+        setVisible (true); toFront (true);
+        startTimerHz (50);
+    }
+    void close() { closing = true; }
+    void timerCallback() override
+    {
+        t += 0.02f;
+        if (closing && (alpha -= 0.07f) <= 0) { stopTimer(); if (onGone) MessageManager::callAsync (onGone); return; }
+        setAlpha (jlimit (0.0f, 1.0f, alpha));
+        repaint();
+    }
+    void paint (Graphics& g) override
+    {
+        auto b = getLocalBounds().toFloat().reduced (1);
+        g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 24.0f);
+        g.setColour (sw::colour::line); g.drawRoundedRectangle (b, 24.0f, 1.0f);
+        // the wave: columns of dots, height follows a travelling sine
+        const int cols = 40, rows = 9; const float dx = 11.0f, x0 = (getWidth() - (cols - 1) * dx) / 2, y0 = 70;
+        for (int c = 0; c < cols; ++c)
+        {
+            const float v = 0.5f + 0.5f * std::sin (c * 0.38f - t * 6.0f) * std::sin (c * 0.11f + t * 1.7f);
+            const int lit = 1 + (int) (v * rows);
+            for (int r = 0; r < rows; ++r)
+            {
+                const bool on = std::abs (r - rows / 2) * 2 < lit;
+                g.setColour (on ? (c % 10 == (int) (t * 20) % 10 ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
+                g.fillRoundedRectangle (x0 + c * dx - 3, y0 + r * dx - 3, 6.0f, 6.0f, 1.8f);
+            }
+        }
+        g.setColour (sw::colour::text); g.setFont (sw::display (34.0f, 0.12f));
+        g.drawText ("SOUNDWAVE", 0, 186, getWidth(), 40, Justification::centred);
+        g.setColour (sw::colour::accent); g.setFont (sw::label (10.0f));
+        g.drawText (swVersionName, 0, 228, getWidth(), 16, Justification::centred);
+        // loading bar made of dots
+        const int n = 24; const float bx = (getWidth() - n * 9.0f) / 2;
+        const int done = jmin (n, (int) (t * 30.0f));
+        for (int i = 0; i < n; ++i)
+        {
+            g.setColour (i < done ? sw::colour::text : sw::colour::line);
+            g.fillRoundedRectangle (bx + i * 9.0f, 270, 5.0f, 5.0f, 1.5f);
+        }
+        g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
+        g.drawText (closing ? "LISTO" : "CARGANDO MOTOR DE AUDIO", 0, 286, getWidth(), 14, Justification::centred);
+    }
+};
+
 struct MainComponent : Component, DragAndDropContainer, MenuBarModel
 {
     MainComponent()
@@ -3313,6 +3464,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         addAndMakeVisible (menu);
         addAndMakeVisible (top); addAndMakeVisible (browser);
         addAndMakeVisible (timeline); addChildComponent (grid); addAndMakeVisible (detail);
+        setupTour();
         top.timeline.onClick = [this] { showGrid (false); };
         top.grid.onClick = [this] { showGrid (true); };
         top.browser.onClick = [this] { browser.setVisible (top.browser.getToggleState()); resized(); };
@@ -3360,7 +3512,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
                     item (43, "Entradas/salidas (I/O)", ""); m.addSeparator();
                     item (44, top.editing ? "Terminar de personalizar" : "Personalizar barra", "");
                     item (45, "Restablecer barra", ""); break;
-            case 5: item (50, "Atajos de teclado", ""); item (51, "Acerca de SoundWave", ""); break;
+            case 5: item (52, "Tour de bienvenida", ""); item (50, "Atajos de teclado", ""); item (51, "Acerca de SoundWave", ""); break;
             default: break;
         }
         return m;
@@ -3382,6 +3534,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
             case 12: splitAtPlayhead(); break;
             case 13: session.duplicateSelected(); break;
             case 14: deleteSelected(); break;
+            case 52: tour.start(); break;
             case 20: session.addTrack (false); break;
             case 22: session.addTrack (true); break;
             case 21: midiClipAtPlayhead(); break;
@@ -3501,6 +3654,39 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         }
         splitter.setVisible (detail.isVisible());
         timeline.setBounds (r); grid.setBounds (r);
+        tour.setBounds (getLocalBounds()); tour.resized();
+    }
+
+    Tour tour;
+    void setupTour()
+    {
+        auto area = [this] (Component& c) { return c.isShowing() ? getLocalArea (&c, c.getLocalBounds()) : Rectangle<int>(); };
+        auto u = [] (const char* t) { return String::fromUTF8 (t); };
+        auto showBrowser = [this] { if (! browser.isVisible()) top.browser.triggerClick(); };
+        tour.steps = {
+            { u ("BIENVENIDO"), u ("SoundWave " ) + swVersionName + u (".\nTe enseño lo esencial en un minuto. Usa las flechas o SIGUIENTE. Puedes repetirlo en AYUDA > Tour de bienvenida."), {}, {} },
+            { u ("LIBRERÍA"), u ("Añade tus carpetas de samples con +. Haz clic en un sonido para escucharlo y arrástralo a una pista para usarlo."),
+              [=, this] { return area (browser); }, [=, this] { showBrowser(); browser.tabSamples.triggerClick(); } },
+            { u ("PLUGINS"), u ("Busca por nombre o por tipo (compresor, reverb, delay...) y arrastra el plugin a una pista. SOUNDWAVE muestra solo los nuestros."),
+              [=, this] { return area (browser); }, [=, this] { showBrowser(); browser.tabInst.triggerClick(); } },
+            { u ("PISTAS"), u ("Crea pistas de AUDIO (Ctrl+T) para grabar voz o guitarra, o MIDI (Ctrl+Shift+T) para sintes. La raya roja marca las MIDI."),
+              [=, this] { return area (top.addTrack); }, {} },
+            { u ("CABECERA DE PISTA"), u ("M silencia, S deja sola, FX abre sus efectos y o la prepara para grabar. Haz clic en ella para seleccionarla: se pone negra."),
+              [=, this] { return area (timeline).withWidth (Timeline::headerW).withTrimmedTop (Timeline::rulerH).withHeight (220); }, {} },
+            { u ("REGLA, LOOP Y ZOOM"), u ("Arriba ves toda la canción. Arrastra en la franja LOOP para crear el loop. En los números, arrastra arriba o abajo con la lupa para el zoom."),
+              [=, this] { return area (timeline).withTrimmedLeft (Timeline::headerW).withHeight (Timeline::rulerH); }, {} },
+            { u ("PLAY Y GRABAR"), u ("Espacio reproduce. R graba en la pista preparada. Haz clic en cualquier punto de una pista para mover la barra roja ahí."),
+              [=, this] { return area (top.play).getUnion (area (top.rec)); }, {} },
+            { u ("PANEL INFERIOR"), u ("Piano roll, editor de audio y cadena de plugins de la pista. Arrastra su borde de arriba para hacerlo más grande o pequeño."),
+              [=, this] { return area (top.panel); }, {} },
+            { u ("VISTA GRID"), u ("Tab cambia entre TIMELINE y GRID, donde lanzas clips en directo como en un directo."),
+              [=, this] { return area (top.grid); }, {} },
+            { u ("EXPORTAR"), u ("Cuando acabes, exporta tu canción a WAV o MP3. ¡A hacer música!"),
+              [=, this] { return area (top.exportBtn); }, {} } };
+        addChildComponent (tour);
+        tour.onDone = [] { settings().setValue ("tourDone", true); };
+        if (! settings().getBoolValue ("tourDone") && ! JUCEApplication::getCommandLineParameters().contains ("test"))
+            Timer::callAfterDelay (2200, [sp = SafePointer<MainComponent> (this)] { if (sp) sp->tour.start(); });
     }
 
     // drag the bar between the arrangement and the bottom panel to resize it
@@ -3537,7 +3723,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
 struct SoundWaveApp : JUCEApplication
 {
     const String getApplicationName() override { return "SoundWave"; }
-    const String getApplicationVersion() override { return "0.1.0"; }
+    const String getApplicationVersion() override { return "0.8.0"; }   // BETA 0.8
 
     struct Window : DocumentWindow
     {
@@ -3565,12 +3751,19 @@ struct SoundWaveApp : JUCEApplication
         Logger::writeToLog ("start: " + SystemStats::getOperatingSystemName() + " args=" + args);
 
         if (args.contains ("--selftest")) { setApplicationReturnValue (selfTest (File (args.fromFirstOccurrenceOf ("--selftest", false, false).trim().unquoted())) ? 0 : 1); quit(); return; }
-        window = std::make_unique<Window>();
-        Logger::writeToLog ("window open");
+        splash = std::make_unique<Splash>();
+        splash->onGone = [this] { splash.reset(); };
+        Timer::callAfterDelay (900, [this]   // let the splash animate a moment, then build the window behind it
+        {
+            window = std::make_unique<Window>();
+            Logger::writeToLog ("window open");
+            if (splash) { splash->toFront (false); Timer::callAfterDelay (500, [this] { if (splash) splash->close(); }); }
+        });
         if (args.contains ("--smoketest"))   // CI: open the real window, let the plugin scan run, then quit cleanly
             Timer::callAfterDelay (12000, [] { Logger::writeToLog ("smoketest ok"); JUCEApplication::quit(); });
     }
-    void shutdown() override { window.reset(); Logger::writeToLog ("quit"); Logger::setCurrentLogger (nullptr); }
+    std::unique_ptr<Splash> splash;
+    void shutdown() override { splash.reset(); window.reset(); Logger::writeToLog ("quit"); Logger::setCurrentLogger (nullptr); }
     std::unique_ptr<FileLogger> logger;
 
     // --selftest <dir>: puts every .wav in <dir> on a track, exports WAV + MP3 next to them, checks they decode.
