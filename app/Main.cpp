@@ -89,10 +89,21 @@ namespace launch
 }
 
 //==============================================================================
+// Engine UI hooks: plugin windows + running render jobs (export).
+struct SWBehaviour : ExtendedUIBehaviour
+{
+    // ponytail: runs to completion on the calling thread, no progress bar; add one if exports get long
+    void runTaskWithProgressBar (te::ThreadPoolJobWithProgress& job) override
+    {
+        while (job.runJob() == ThreadPoolJob::jobNeedsRunningAgain) {}
+    }
+};
+
+//==============================================================================
 // Shared state
 struct Session
 {
-    te::Engine engine { "SoundWave", std::make_unique<ExtendedUIBehaviour>(), nullptr };
+    te::Engine engine { "SoundWave", std::make_unique<SWBehaviour>(), nullptr };
     std::unique_ptr<te::Edit> edit;
     File editFile = File::getSpecialLocation (File::userDocumentsDirectory).getChildFile ("SoundWave/Untitled.tracktionedit");
     std::function<void()> onChange;   // structure changed (tracks/clips/plugins)
@@ -749,6 +760,63 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
 };
 
 //==============================================================================
+// Rendering (used by the EXPORT dialog and by --selftest)
+static te::LibLameEncoderAudioFormat& lame()
+{
+    // Prefer the copy shipped next to the executable, then the system one.
+    static te::LibLameEncoderAudioFormat f ([] {
+        auto name = te::LibLameEncoderAudioFormat::getDefaultLibraryName();
+        auto local = File::getSpecialLocation (File::currentExecutableFile).getSiblingFile (name);
+        return local.existsAsFile() ? local.getFullPathName() : name; }());
+    return f;
+}
+
+struct ExportOptions
+{
+    bool wav = true;
+    int bitDepth = 24;
+    double sampleRate = 48000.0;
+    int mp3Quality = 0;      // index into the EXPORT dialog's MP3 list
+    bool loopOnly = false;
+    int normalise = 0;       // 0 off, 1 peak 0 dB, 2 peak -1 dB, 3 -14 LUFS, 4 -9 LUFS
+    bool dither = true, masterFx = true;
+};
+
+static bool renderEdit (te::Edit& edit, const File& dest, const ExportOptions& o)
+{
+    static WavAudioFormat wavFormat;
+    if (! o.wav && ! lame().isLibraryLoaded()) return false;
+    te::Renderer::Parameters p (edit);
+    p.tracksToDo = te::toBitSet (te::getAllTracks (edit));   // empty set renders nothing
+    p.destFile = dest;
+    p.audioFormat = o.wav ? (AudioFormat*) &wavFormat : (AudioFormat*) &lame();
+    p.bitDepth = o.wav ? o.bitDepth : 16;
+    p.sampleRateForAudio = o.wav ? o.sampleRate : jmin (48000.0, o.sampleRate);
+    if (! o.wav)   // map our short list onto LAME's option list
+    {
+        const char* names[] = { "320 Kb/s CBR", "256 Kb/s CBR", "192 Kb/s CBR", "128 Kb/s CBR",
+                                "VBR quality 0 (best)", "VBR quality 2", "VBR quality 4 (normal)" };
+        p.quality = jmax (0, lame().getQualityOptions().indexOf (names[jlimit (0, 6, o.mp3Quality)]));
+    }
+    auto& tc = edit.getTransport();
+    p.time = o.loopOnly ? tc.getLoopRange() : te::TimeRange (te::TimePosition(), edit.getLength());
+    p.ditheringEnabled = o.wav && o.dither && p.bitDepth < 32;
+    p.useMasterPlugins = o.masterFx;
+    p.canRenderInMono = false;
+    switch (o.normalise)
+    {
+        case 1: p.shouldNormalise = true; p.normaliseToLevelDb = 0.0f; break;
+        case 2: p.shouldNormalise = true; p.normaliseToLevelDb = -1.0f; break;
+        case 3: p.shouldNormaliseByLUFS = true; p.normaliseToLevelDb = -14.0f; break;
+        case 4: p.shouldNormaliseByLUFS = true; p.normaliseToLevelDb = -9.0f; break;
+        default: break;
+    }
+    tc.stop (false, false);
+    // ponytail: renders on the message thread (UI waits); move to a background job if songs get long
+    return te::Renderer::renderToFile ("Export", p).existsAsFile();
+}
+
+//==============================================================================
 // EXPORT dialog: WAV / MP3 with quality options
 struct ExportPanel : Component
 {
@@ -778,12 +846,6 @@ struct ExportPanel : Component
         if (! wav && rate.getSelectedId() > 2) rate.setSelectedId (2);
         status = wav ? "" : (lame().isLibraryLoaded() ? "LAME " + lame().getLibraryVersion() : "MP3 NEEDS LIBMP3LAME (SEE README)");
         repaint();
-    }
-
-    static te::LibLameEncoderAudioFormat& lame()
-    {
-        static te::LibLameEncoderAudioFormat f (te::LibLameEncoderAudioFormat::getDefaultLibraryName());
-        return f;
     }
 
     void paint (Graphics& g) override
@@ -826,37 +888,16 @@ struct ExportPanel : Component
 
     bool render (const File& dest)
     {
-        auto& edit = *session.edit;
-        te::Renderer::Parameters p (edit);
-        static WavAudioFormat wavFormat;
-        const bool wav = format.getSelectedId() == 1;
-        if (! wav && ! lame().isLibraryLoaded()) return false;
-        p.destFile = dest;
-        p.audioFormat = wav ? (AudioFormat*) &wavFormat : (AudioFormat*) &lame();
-        p.bitDepth = wav ? std::array { 16, 24, 32 }[(size_t) bits.getSelectedItemIndex()] : 16;
-        p.sampleRateForAudio = std::array { 44100.0, 48000.0, 88200.0, 96000.0 }[(size_t) rate.getSelectedItemIndex()];
-        if (! wav)   // map our short list to LAME's option list
-        {
-            auto opts = lame().getQualityOptions();
-            const char* names[] = { "320 Kb/s CBR", "256 Kb/s CBR", "192 Kb/s CBR", "128 Kb/s CBR", "VBR quality 0 (best)", "VBR quality 2", "VBR quality 4 (normal)" };
-            p.quality = jmax (0, opts.indexOf (names[mp3.getSelectedItemIndex()]));
-        }
-        auto& tc = edit.getTransport();
-        p.time = range.getSelectedId() == 2 ? tc.getLoopRange() : te::TimeRange (te::TimePosition(), edit.getLength());
-        p.ditheringEnabled = wav && dither.getToggleState() && p.bitDepth < 32;
-        p.useMasterPlugins = master.getToggleState();
-        p.canRenderInMono = false;
-        switch (norm.getSelectedId())
-        {
-            case 2: p.shouldNormalise = true; p.normaliseToLevelDb = 0.0f; break;
-            case 3: p.shouldNormalise = true; p.normaliseToLevelDb = -1.0f; break;
-            case 4: p.shouldNormaliseByLUFS = true; p.normaliseToLevelDb = -14.0f; break;
-            case 5: p.shouldNormaliseByLUFS = true; p.normaliseToLevelDb = -9.0f; break;
-            default: break;
-        }
-        tc.stop (false, false);
-        // ponytail: renders on the message thread (UI waits); move to a background job if songs get long
-        return te::Renderer::renderToFile ("Export", p).existsAsFile();
+        ExportOptions o;
+        o.wav = format.getSelectedId() == 1;
+        o.bitDepth = std::array { 16, 24, 32 }[(size_t) bits.getSelectedItemIndex()];
+        o.sampleRate = std::array { 44100.0, 48000.0, 88200.0, 96000.0 }[(size_t) rate.getSelectedItemIndex()];
+        o.mp3Quality = mp3.getSelectedItemIndex();
+        o.loopOnly = range.getSelectedId() == 2;
+        o.normalise = norm.getSelectedId() - 1;
+        o.dither = dither.getToggleState();
+        o.masterFx = master.getToggleState();
+        return renderEdit (*session.edit, dest, o);
     }
 
     Session& session;
@@ -1087,7 +1128,46 @@ struct SoundWaveApp : JUCEApplication
         void closeButtonPressed() override { JUCEApplication::getInstance()->systemRequestedQuit(); }
     };
 
-    void initialise (const String&) override { window = std::make_unique<Window>(); }
+    void initialise (const String& args) override
+    {
+        if (args.contains ("--selftest")) { setApplicationReturnValue (selfTest (File (args.fromFirstOccurrenceOf ("--selftest", false, false).trim().unquoted())) ? 0 : 1); quit(); return; }
+        window = std::make_unique<Window>();
+    }
+
+    // --selftest <dir>: puts every .wav in <dir> on a track, exports WAV + MP3 next to them, checks they decode.
+    static bool selfTest (const File& dir)
+    {
+        Session s;
+        s.edit->ensureNumberOfAudioTracks (1);
+        auto wavs = dir.findChildFiles (File::findFiles, false, "*.wav");
+        wavs.removeIf ([] (const File& f) { return f.getFileName().startsWith ("selftest"); });
+        auto t = te::getAudioTracks (*s.edit)[0];
+        double at = 0;
+        for (auto& f : wavs) if (auto c = s.addAudioFile (*t, f, te::TimePosition::fromSeconds (at), false)) at = c->getPosition().getEnd().inSeconds();
+        AudioFormatManager fm; fm.registerBasicFormats();
+        bool ok = true;
+        for (bool wav : { true, false })
+        {
+            ExportOptions o; o.wav = wav; o.normalise = 2;
+            auto out = dir.getChildFile (wav ? "selftest.wav" : "selftest.mp3");
+            out.deleteFile();
+            const bool rendered = renderEdit (*s.edit, out, o);
+            std::unique_ptr<AudioFormatReader> r (fm.createReaderFor (out));
+            float hi = 0;
+            if (r)
+            {
+                Range<float> lv[8];
+                r->readMaxLevels (0, r->lengthInSamples, lv, jmin (8, (int) r->numChannels));
+                hi = jmax (lv[0].getEnd(), -lv[0].getStart());
+            }
+            const bool good = rendered && r && r->lengthInSamples > 0 && hi > 0.5f;
+            std::cout << (good ? "OK   " : "FAIL ") << out.getFileName() << " bytes=" << out.getSize()
+                      << " secs=" << (r ? r->lengthInSamples / r->sampleRate : 0) << " peak=" << hi << std::endl;
+            ok &= good;
+        }
+        s.edit->getUndoManager().clearUndoHistory();
+        return ok;
+    }
     void shutdown() override { window.reset(); }
     std::unique_ptr<Window> window;
 };
