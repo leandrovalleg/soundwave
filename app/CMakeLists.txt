@@ -14,7 +14,7 @@ juce_add_gui_app(SoundWave
     ICON_BIG ../brand/icon.png)
 
 juce_add_binary_data(SWAppFonts SOURCES
-    ../fonts/Doto.ttf ../fonts/SpaceMono-Regular.ttf ../fonts/SpaceMono-Bold.ttf)
+    ../fonts/Doto.ttf ../fonts/SpaceMono-Regular.ttf ../fonts/SpaceMono-Bold.ttf ../brand/icon.png)
 
 target_sources(SoundWave PRIVATE Main.cpp)
 

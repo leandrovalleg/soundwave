@@ -3477,17 +3477,13 @@ struct Splash : Component, Timer
             g.setColour (i < done ? (i == done - 1 ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
             g.fillRoundedRectangle (24 + i * 12.0f, 252, 6.0f, 6.0f, 1.8f);
         }
-        // name + build, logo bottom right
-        g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
-        g.drawText ("SoundWave " + String (swVersionName), 24, 300, 260, 18, Justification::centredLeft);
+        // official logo: the icon with the SoundWave name beside it, build line underneath
+        static const Image icon = ImageCache::getFromMemory (BinaryData::icon_png, BinaryData::icon_pngSize);
+        g.drawImageWithin (icon, 24, 296, 44, 44, RectanglePlacement::centred);
+        g.setColour (sw::colour::text); g.setFont (sw::mono (20.0f));
+        g.drawText ("SoundWave", 78, 298, 260, 24, Justification::centredLeft);
         g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
-        g.drawText ((closing ? String ("LISTO") : String ("CARGANDO")) + "  ·  BUILD " + String (__DATE__).toUpperCase(), 24, 320, 260, 14, Justification::centredLeft);
-        const int w[][2] = { {0,0},{0,1},{1,2},{2,0},{2,1},{3,2},{4,0},{4,1} };   // dot W
-        for (auto& d : w)
-        {
-            g.setColour (sw::colour::text);
-            g.fillRoundedRectangle (326 + d[0] * 7.0f, 306 + d[1] * 7.0f, 5.0f, 5.0f, 1.5f);
-        }
+        g.drawText ((closing ? String ("LISTO") : String ("CARGANDO")) + "  ·  BUILD " + String (__DATE__).toUpperCase(), 78, 322, 260, 14, Justification::centredLeft);
     }
 };
 
