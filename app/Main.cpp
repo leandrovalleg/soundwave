@@ -2579,6 +2579,34 @@ struct DeviceChain : Component
         void duplicate() { session.insertPluginCopy (*track, plugin->state, track->pluginList.indexOf (plugin.get()) + 1); }
 
         // right-click: duplicate, copy, paste after, move to another track, move, delete
+        // drag a card sideways to reorder the chain; it follows the mouse and drops into the nearest slot
+        int dragFromX = -1;
+        void mouseDrag (const MouseEvent& e) override
+        {
+            if (e.mods.isPopupMenu() || e.getDistanceFromDragStart() < 6) return;
+            if (dragFromX < 0) { dragFromX = getX(); toFront (false); setAlpha (0.85f); setMouseCursor (MouseCursor::DraggingHandCursor); }
+            setTopLeftPosition (jmax (0, dragFromX + e.getDistanceFromDragStartX()), getY());
+        }
+        void mouseUp (const MouseEvent&) override
+        {
+            if (dragFromX < 0) return;
+            const int slot = getWidth() + 6, delta = roundToInt ((getX() - dragFromX) / (float) slot);
+            dragFromX = -1; setAlpha (1.0f); setMouseCursor (MouseCursor::NormalCursor);
+            if (delta == 0) { MessageManager::callAsync ([&s = session] { s.changed(); }); return; }   // snap back
+            auto parent = plugin->state.getParent();
+            const int from = parent.indexOf (plugin->state);
+            int to = from;
+            for (int step = delta > 0 ? 1 : -1; to != from + delta; to += step)   // stop before the track's own volume/level plugins
+            {
+                const int next = to + step;
+                if (next < 0 || next >= parent.getNumChildren()) break;
+                bool user = false;
+                for (auto other : track->pluginList) if (other->state == parent.getChild (next)) user = Session::isUserPlugin (other);
+                if (! user) break;
+            }
+            if (to != from) parent.moveChild (from, to, &session.edit->getUndoManager());
+            MessageManager::callAsync ([&s = session] { s.changed(); });   // rebuilds the cards (this one included)
+        }
         void mouseDown (const MouseEvent& e) override
         {
             if (! e.mods.isPopupMenu()) return;
