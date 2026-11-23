@@ -748,9 +748,21 @@ struct PluginTiles : Component
         if (auto* d = tileAt (e.getMouseDownPosition()))
             if (auto* dc = DragAndDropContainer::findParentDragContainerFor (this); dc && ! dc->isDragAndDropActive())
             {
-                Rectangle<int> tile; forEachTile ([&] (const PluginDescription& o, Rectangle<int> r) { if (&o == d) tile = r; });
-                auto img = createComponentSnapshot (tile, true, 2.0f);
-                img.multiplyAllAlphas (0.85f);
+                // what follows the mouse: a black capsule with the dot icon and the name in the dot font
+                auto name = (d->name.startsWith ("SW ") ? d->name.substring (3) : d->name).toUpperCase();
+                const int w = jmin (240, 54 + GlyphArrangement::getStringWidthInt (sw::display (16.0f), name)), h = 40;
+                Image img (Image::ARGB, w * 2, h * 2, true);
+                {
+                    Graphics g (img); g.addTransform (AffineTransform::scale (2.0f));
+                    g.setColour (sw::colour::text.withAlpha (0.92f)); g.fillRoundedRectangle (0, 0, (float) w, (float) h, h / 2.0f);
+                    auto* bits = typeGlyph (pluginType (*d));
+                    for (int i = 0; i < 25; ++i)
+                        if (bits[i] == '1')
+                        { g.setColour (d->manufacturerName == "SoundWave" ? sw::colour::accent : sw::colour::card);
+                          g.fillRoundedRectangle (16 + (i % 5) * 4.0f, 10 + (i / 5) * 4.0f, 3.0f, 3.0f, 1.0f); }
+                    g.setColour (sw::colour::card); g.setFont (sw::display (16.0f));
+                    g.drawText (name, 44, 0, w - 52, h, Justification::centredLeft, true);
+                }
                 dc->startDragging ("swplugin:" + d->createIdentifierString(), this, ScaledImage (img, 2.0),
                                    false, nullptr, &e.source);
             }
@@ -1389,14 +1401,34 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             g.setColour (sw::colour::accent);
             g.fillRect (0.0f, (float) rowBounds (dropLine).getY() + (dropLine > dragTrack ? rowH - 2 : 0), (float) headerW, 2.0f);
         }
-        if (dropHighlight >= 0)
+        if (dropHighlight >= 0)   // drop target: faint lane + the track card outlined in red dots
         {
-            g.setColour (sw::colour::text.withAlpha (0.06f));
+            g.setColour (sw::colour::accent.withAlpha (0.05f));
             g.fillRect (rowBounds (dropHighlight).withTrimmedLeft (headerW));
+            Path p; p.addRoundedRectangle (rowBounds (dropHighlight).withWidth (headerW).reduced (4, 2).toFloat(), 14.0f);
+            const float len = p.getLength(), off = std::fmod ((float) Time::getMillisecondCounter() * 0.02f, 7.0f);
+            g.setColour (sw::colour::accent);
+            for (float d = off; d < len; d += 7.0f) { auto pt = p.getPointAlongPath (d); g.fillRoundedRectangle (pt.x - 1.5f, pt.y - 1.5f, 3, 3, 1); }
+        }
+        if (burstT >= 0)   // plugin dropped: a ring of dots lights up and spreads out, like a glyph light
+        {
+            const float e = 1.0f - std::pow (1.0f - burstT, 3.0f);
+            for (int ring = 0; ring < 2; ++ring)
+            {
+                const float rad = 8 + e * (40 + ring * 22), a = (1.0f - burstT) * (ring == 0 ? 1.0f : 0.5f);
+                const int n = 12 + ring * 6;
+                g.setColour (sw::colour::accent.withAlpha (a));
+                for (int i = 0; i < n; ++i)
+                {
+                    const float ang = MathConstants<float>::twoPi * i / n;
+                    g.fillRoundedRectangle (burstAt.x + std::cos (ang) * rad - 2, burstAt.y + std::sin (ang) * rad - 2, 4, 4, 1.2f);
+                }
+            }
         }
     }
+    Point<float> burstAt; float burstT = -1;
 
-    void timerCallback() override { repaint(); }
+    void timerCallback() override { if (burstT >= 0 && (burstT += 0.06f) > 1) burstT = -1; repaint(); }
 
     te::Clip* clipAt (Point<int> p, int& rowOut)
     {
@@ -1695,7 +1727,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     {
         if (dropPlugin (session, d.description.toString(), [&] { auto trs = tracks(); int r = rowAt (d.localPosition.y);
                                                                  return isPositiveAndBelow (r, trs.size()) ? trs[r] : session.addTrack(); }))
-        { dropHighlight = -1; repaint(); return; }
+        { dropHighlight = -1; burstAt = d.localPosition.toFloat(); burstT = 0; repaint(); return; }
         drop (draggedFile, d.localPosition);
     }
     void filesDropped (const StringArray& f, int x, int y) override { drop (File (f[0]), { x, y }); }
@@ -3395,19 +3427,7 @@ struct Tour : Component, Timer
         g.setColour (Colours::white.withAlpha (0.05f));   // faint dot grid on the dark layer
         for (int y = 8; y < getHeight(); y += 16) for (int x = 8; x < getWidth(); x += 16)
             if (! hl.contains ((float) x, (float) y)) g.fillRect (x, y, 2, 2);
-        if (hl.getWidth() > 4)   // pulsing red ring, plus red dots marching around it
-        {
-            const float p = 0.5f + 0.5f * std::sin (phase * 3.0f);
-            g.setColour (sw::colour::accent.withAlpha (0.45f + 0.5f * p));
-            g.drawRoundedRectangle (hl.expanded (3 + 4 * p), 17.0f, 2.0f);
-            Path ring; ring.addRoundedRectangle (hl.expanded (12), 20.0f);
-            const float len = ring.getLength();
-            for (int i = 0; i < 4; ++i)
-            {
-                auto pt = ring.getPointAlongPath (std::fmod (phase * 90.0f + i * len / 4, len));
-                g.setColour (sw::colour::accent); g.fillRoundedRectangle (pt.x - 3, pt.y - 3, 6, 6, 1.8f);
-            }
-        }
+        if (hl.getWidth() > 4) { g.setColour (Colours::white.withAlpha (0.9f)); g.drawRoundedRectangle (hl, 14.0f, 1.5f); }
         const float ease = 1.0f - std::pow (1.0f - cardIn, 3.0f);
         g.beginTransparencyLayer (ease);
         auto c = card().toFloat().translated (0, (1.0f - ease) * 14.0f);
