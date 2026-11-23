@@ -16,7 +16,6 @@ WizardStyle=modern
 WizardImageFile=art\wizard-164x314.bmp,art\wizard-246x459.bmp,art\wizard-328x628.bmp,art\wizard-410x797.bmp
 WizardSmallImageFile=art\small-55x55.bmp,art\small-83x80.bmp,art\small-110x106.bmp,art\small-138x140.bmp
 WizardImageStretch=no
-WizardImageBackColor=$EFEFEF
 LicenseFile=..\LICENSE
 Compression=lzma2
 SolidCompression=yes
