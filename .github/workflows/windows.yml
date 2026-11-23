@@ -18,15 +18,21 @@ jobs:
           git submodule update --init --depth 1 JUCE tracktion_engine
           git -C tracktion_engine submodule update --init --depth 1 modules/juce
 
+      - uses: ilammy/msvc-dev-cmd@v1   # whichever Visual Studio the runner has, x64
+
+      - name: Ninja
+        shell: bash
+        run: command -v ninja || choco install ninja -y
+
       - name: Build plugins (VST3)
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64
-          cmake --build build --config Release --parallel
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
 
       - name: Build SoundWave app
         run: |
-          cmake -S app -B app/build -G "Visual Studio 17 2022" -A x64
-          cmake --build app/build --config Release --parallel
+          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build app/build
 
       - name: Build MP3 encoder (LAME, LGPL)
         shell: bash
