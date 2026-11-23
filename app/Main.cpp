@@ -1449,6 +1449,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
                     { if (res == 1) { c->removeFromParent(); selected = nullptr; session.changed(); } });
                 return;
             }
+            edit().getTransport().setPosition (timeAt ((float) e.x));   // like Ableton: clicking a clip also moves the playhead there
             dragStart = selected->getPosition().getStart();
             dragEnd = selected->getPosition().getEnd();
             auto b = clipBounds (row, *selected);
