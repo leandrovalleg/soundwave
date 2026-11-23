@@ -28,6 +28,7 @@ target_compile_features(SoundWave PRIVATE cxx_std_20)
 target_include_directories(SoundWave PRIVATE ../plugins)
 target_compile_definitions(SoundWave PRIVATE
     JUCE_PLUGINHOST_VST3=1
+    $<$<PLATFORM_ID:Darwin>:JUCE_PLUGINHOST_AU=1>
     $<$<BOOL:$ENV{VST2_SDK_DIR}>:JUCE_PLUGINHOST_VST=1>
     JUCE_MODAL_LOOPS_PERMITTED=1
     JUCE_STRICT_REFCOUNTEDPOINTER=1

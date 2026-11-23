@@ -5,13 +5,18 @@ add_subdirectory(JUCE)
 # Open-licensed fonts (OFL, see fonts/*-OFL.txt) used by plugins/SWDesign.h
 juce_add_binary_data(SWFonts SOURCES fonts/Doto.ttf fonts/SpaceMono-Regular.ttf fonts/SpaceMono-Bold.ttf)
 
+set(SW_FORMATS VST3)
+if (APPLE)
+  list(APPEND SW_FORMATS AU)   # Logic and GarageBand only load Audio Units
+endif()
+
 function(sw_plugin NAME CODE)  # extra args (e.g. IS_SYNTH TRUE) go to juce_add_plugin
   juce_add_plugin(${NAME} ${ARGN}
     COMPANY_NAME "SoundWave"
     PLUGIN_MANUFACTURER_CODE Sndw
     PLUGIN_CODE ${CODE}
     PRODUCT_NAME "SW ${NAME}"
-    FORMATS VST3
+    FORMATS ${SW_FORMATS}
     COPY_PLUGIN_AFTER_BUILD FALSE)
   target_sources(${NAME} PRIVATE plugins/${NAME}.cpp)
   target_include_directories(${NAME} PRIVATE plugins)
