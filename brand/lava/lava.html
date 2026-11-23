@@ -1,0 +1,77 @@
+<html><head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@900&family=Space+Mono&display=swap">
+<style>
+body{margin:0;font-family:'Space Mono',monospace;background:#EFEFEF}
+.app{position:relative;width:1200px;height:700px;overflow:hidden;background:#ECECEC}
+.app::after{content:"";position:absolute;inset:0;background-image:radial-gradient(rgba(0,0,0,.13) 1px,transparent 1.2px);background-size:14px 14px;pointer-events:none;z-index:1}
+.lava{position:absolute;border-radius:50%;filter:blur(var(--blur));opacity:var(--op);z-index:0}
+.ui{position:absolute;inset:0;z-index:2}
+.glass{background:rgba(255,255,255,var(--glass));backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);
+  border:1px solid rgba(255,255,255,.65);box-shadow:var(--neo)}
+.bar{position:absolute;left:0;right:0}
+.pill{display:inline-flex;align-items:center;height:22px;padding:0 10px;margin-right:4px;border-radius:8px;font-size:8.5px;letter-spacing:.12em;
+  background:rgba(255,255,255,var(--pill));border:1px solid rgba(255,255,255,.7);box-shadow:var(--neoSmall)}
+.pill.on{background:rgba(228,228,228,.85)}
+.pill.rec{color:#D71921}
+.card{position:absolute;border-radius:16px}
+.h{font-family:Doto;font-size:15px}
+.row{position:absolute;left:0;right:0;height:62px;border-bottom:1px solid rgba(0,0,0,.06)}
+.head{position:absolute;left:8px;top:6px;width:160px;height:48px;border-radius:12px;padding:6px 10px;box-sizing:border-box}
+.clip{position:absolute;top:8px;height:46px;border-radius:8px;background:rgba(255,255,255,.75);border:1px solid rgba(255,255,255,.9);font-size:8px;padding:4px 6px;box-sizing:border-box;box-shadow:var(--neoSmall)}
+.io{position:absolute;right:8px;top:6px;width:240px;height:48px;border-radius:12px}
+.label{font-size:8px;letter-spacing:.14em;color:#8A8A8A}
+@keyframes drift1{0%{transform:translate(0,0)}50%{transform:translate(120px,60px) scale(1.15)}100%{transform:translate(0,0)}}
+@keyframes drift2{0%{transform:translate(0,0)}50%{transform:translate(-140px,-40px) scale(.9)}100%{transform:translate(0,0)}}
+</style></head><body>
+<script>
+function app(title, cfg){
+  const a=document.createElement('div'); a.className='app';
+  for (const [k,v] of Object.entries(cfg.vars)) a.style.setProperty(k,v);
+  // lava blobs
+  cfg.blobs.forEach(([x,y,w,h,c,anim])=>{ const b=document.createElement('div'); b.className='lava';
+    b.style.cssText+=`left:${x}px;top:${y}px;width:${w}px;height:${h}px;background:radial-gradient(circle at 40% 40%, ${c[0]}, ${c[1]} 55%, transparent 72%);animation:${anim} 14s ease-in-out infinite`; a.appendChild(b); });
+  const ui=document.createElement('div'); ui.className='ui'; a.appendChild(ui);
+  ui.innerHTML=`
+  <div class="bar glass" style="top:0;height:26px;border-radius:0;display:flex;align-items:center;padding:0 12px;font-size:9px;letter-spacing:.14em;gap:22px">
+    <span>ARCHIVO</span><span>EDICIÓN</span><span>CREAR</span><span>REPRODUCCIÓN</span><span>VER</span><span>AYUDA</span>
+    <span style="flex:1"></span><span class="pill on">BROWSER</span><span class="pill on">PANEL</span><span class="pill on">TIMELINE</span><span class="pill">GRID</span><span class="pill">TRACK</span><span class="pill">EXPORT</span><span class="pill">SETTINGS</span></div>
+  <div class="bar glass" style="top:26px;height:36px;border-radius:0;display:flex;align-items:center;padding:0 12px">
+    <span class="h" style="width:110px">SOUNDWAVE</span><span class="pill">TAP</span><span class="pill" style="font-family:Doto;font-size:13px">120.00</span><span class="pill">4/4</span>
+    <span class="pill"><b style="color:#D71921">●●</b>&nbsp;CLICK&nbsp;⌄</span><span class="pill">1 BAR</span><span style="width:14px"></span>
+    <span class="pill">▶ PLAY</span><span class="pill">■ STOP</span><span class="pill rec">● REC</span><span class="h" style="margin:0 14px">1.1.1</span><span class="pill">LOOP</span></div>
+  <div class="card glass" style="left:10px;top:72px;width:230px;height:618px;padding:14px;box-sizing:border-box">
+    <div class="h">LIBRARY</div>
+    <div style="margin:10px 0"><span class="pill on">SAMPLES</span><span class="pill">INSTRUMENTS</span></div>
+    ${['Clap & Snare','Fills','FX','Hi-Hats','Kick'].map((t,i)=>`<div style="font-size:10px;margin:7px 0;display:flex;gap:8px;align-items:center"><span style="color:#D71921;letter-spacing:-1px">▭</span>${t}</div>`).join('')}
+    ${['Clap - Crispy.wav','Clap - Layer.wav','Snare - Air.wav'].map(t=>`<div style="font-size:10px;margin:7px 0 7px 18px;color:#555">∿ ${t}</div>`).join('')}
+  </div>
+  <div style="position:absolute;left:250px;top:72px;right:10px;height:330px">
+    ${['TRACK 1','TRACK 2','TRACK 3','TRACK 4','A REVERB'].map((t,i)=>`<div class="row" style="top:${i*64}px">
+      <div class="head glass"><div class="h" style="font-size:12px">${String(i+1).padStart(2,'0')}  ${t}</div><div class="label" style="margin-top:6px">M  S  FX  ●</div></div>
+      ${i==0?'<div class="clip" style="left:190px;width:120px">KICK 120 ∿∿∿</div><div class="clip" style="left:420px;width:120px">KICK 120</div>':''}
+      ${i==1?'<div class="clip" style="left:190px;width:160px">BASS C ▬▬▬</div>':''}
+      ${i==3?'<div class="clip" style="left:190px;width:240px;border-color:#D71921">PAD Am</div>':''}
+      <div class="io glass"></div></div>`).join('')}
+    <div style="position:absolute;left:250px;top:0;bottom:0;width:1.5px;background:#D71921"></div>
+  </div>
+  <div class="card glass" style="left:250px;top:412px;width:560px;height:278px;padding:12px;box-sizing:border-box">
+    <div class="label">GRID 1/16 · LENGTH · QUANTISE</div>
+    <div style="position:absolute;left:12px;top:36px;right:12px;bottom:12px;border-radius:8px;background:repeating-linear-gradient(0deg,rgba(255,255,255,.35) 0 10px,rgba(0,0,0,.03) 10px 20px)">
+      ${[[40,30,40],[100,50,30],[160,30,40],[240,70,60],[330,50,40]].map(([x,y,w])=>`<div style="position:absolute;left:${x}px;top:${y}px;width:${w}px;height:8px;border-radius:2px;background:#111"></div>`).join('')}</div>
+  </div>
+  <div class="card glass" style="left:820px;top:412px;width:370px;height:278px;padding:12px;box-sizing:border-box">
+    <div class="h" style="font-size:13px">DEVICES ( TRACK 1 )</div>
+    <div class="glass" style="margin-top:10px;width:200px;height:200px;border-radius:12px;padding:10px;box-sizing:border-box"><div class="h" style="font-size:12px">SW TIDE</div><div class="label" style="color:#D71921">INSTRUMENT</div></div>
+  </div>`;
+  const wrap=document.createElement('div'); wrap.style.cssText='display:inline-block;margin:10px';
+  wrap.appendChild(Object.assign(document.createElement('div'),{textContent:title,style:'font-family:Doto;font-size:20px;margin:6px 0'}));
+  wrap.appendChild(a); document.body.appendChild(wrap);
+}
+const neo='8px 8px 18px rgba(0,0,0,.10), -6px -6px 14px rgba(255,255,255,.85), inset 0 1px 0 rgba(255,255,255,.8)';
+const neoS='3px 3px 7px rgba(0,0,0,.08), -3px -3px 6px rgba(255,255,255,.9)';
+app('A  LAVA SUAVE', {vars:{'--glass':'.72','--pill':'.85','--blur':'70px','--op':'.45','--neo':neo,'--neoSmall':neoS},
+  blobs:[[-120,420,420,360,['#ff3b41','#D71921'],'drift1'],[880,-80,380,320,['#ff5a3c','#D71921'],'drift2']]});
+app('B  LAVA MEDIA', {vars:{'--glass':'.55','--pill':'.75','--blur':'60px','--op':'.7','--neo':neo,'--neoSmall':neoS},
+  blobs:[[-80,380,460,420,['#ff3b41','#D71921'],'drift1'],[760,-60,460,360,['#ff6a3c','#C4121A'],'drift2'],[420,300,320,280,['#ff2d36','#A50E14'],'drift1']]});
+app('C  LAVA INTENSA', {vars:{'--glass':'.42','--pill':'.65','--blur':'55px','--op':'.9','--neo':neo,'--neoSmall':neoS},
+  blobs:[[-60,360,520,460,['#ff4a3c','#D71921'],'drift1'],[700,-80,540,420,['#ff6a3c','#C4121A'],'drift2'],[380,260,420,360,['#ff2d36','#8E0B10'],'drift1'],[1000,420,300,300,['#ff7a4c','#D71921'],'drift2']]});
+</script></body></html>
