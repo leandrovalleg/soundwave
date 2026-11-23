@@ -1115,7 +1115,33 @@ struct IORow : Component, Timer
 // TIMELINE: horizontal arrangement
 struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, ChangeListener
 {
-    static constexpr int headerW = 190, rulerH = 28;
+    // ruler, top to bottom: overview of the whole song · loop brace · bar numbers (drag: up/down zoom, sideways scroll)
+    static constexpr int headerW = 190, ovH = 18, loopH = 14, rulerH = ovH + loopH + 24;
+    enum class RulerDrag { none, overview, loopNew, loopMove, loopStart, loopEnd, zoom } rulerDrag = RulerDrag::none;
+    double downPx = 0; float downScroll = 0; te::TimePosition downT; te::TimeRange downLoop;
+    int rulerRight() const { return getWidth() - 56; }
+    double songLength() { return jmax (60.0, edit().getLength().inSeconds() * 1.1, timeAt ((float) rulerRight()).inSeconds()); }
+    float ovX (double t) { return headerW + (float) (t / songLength()) * (rulerRight() - headerW); }
+    static const MouseCursor& zoomCursor()   // dot magnifier, like everything else
+    {
+        static MouseCursor c = []
+        {
+            Image im (Image::ARGB, 22, 22, true); Graphics g (im);
+            const char* bits[] = { "..111...", ".1...1..", "1.....1.", "1.....1.", "1.....1.", ".1...1..", "..111.1.", ".......1" };
+            for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x)
+                if (bits[y][x] == '1') { g.setColour (Colours::white); g.fillRect (x * 2.5f - 0.5f, y * 2.5f - 0.5f, 3.0f, 3.0f); }
+            for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x)
+                if (bits[y][x] == '1') { g.setColour (sw::colour::text); g.fillRect (x * 2.5f, y * 2.5f, 2.0f, 2.0f); }
+            return MouseCursor (im, 7, 7);
+        }();
+        return c;
+    }
+    te::TimePosition snapBeat (te::TimePosition t, bool free)
+    {
+        if (free) return t;
+        auto& ts = edit().tempoSequence;
+        return ts.toTime (te::BeatPosition::fromBeats (std::round (ts.toBeats (t).inBeats())));
+    }
     int rowH = 70;
     int scrollY = 0;
     bool scrubbing = false;
@@ -1152,7 +1178,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             io[i]->setBounds (rowBounds (i).withLeft (getWidth() - ioW));
             io[i]->setVisible (rowBounds (i).getY() >= rulerH - 4);   // hidden once it scrolls under the ruler
         }
-        ioToggle.setBounds (getWidth() - 52, 2, 46, rulerH - 4);
+        ioToggle.setBounds (getWidth() - 52, ovH + loopH, 46, rulerH - ovH - loopH - 3);
         auto r = getLocalBounds().reduced (10).removeFromBottom (26).withTrimmedRight (io.isEmpty() ? 0 : ioW).removeFromRight (4 * 40 + 30);
         for (auto* b : { &zOut, &zIn }) { b->setBounds (r.removeFromLeft (40)); r.removeFromLeft (4); }
         r.removeFromLeft (18);
@@ -1190,9 +1216,37 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         paintBackground (g, getLocalBounds());
         auto& ts = edit().tempoSequence;
 
-        // ruler: bar numbers
+        // ruler: overview, loop brace, bar numbers
         g.setColour (sw::colour::card); g.fillRect (0, 0, getWidth(), rulerH);
         g.setColour (sw::colour::line); g.drawHorizontalLine (rulerH - 1, 0, (float) getWidth());
+        {
+            auto ov = Rectangle<float> ((float) headerW, 3.0f, (float) (rulerRight() - headerW), ovH - 5.0f);
+            g.setColour (sw::colour::subtle); g.fillRoundedRectangle (ov, 6.0f);
+            auto trs0 = tracks();
+            const float lh = jmax (1.0f, (ov.getHeight() - 4) / jmax (1, trs0.size()));
+            for (int i = 0; i < trs0.size(); ++i)   // every clip of the song, tiny
+                for (auto c : trs0[i]->getClips())
+                {
+                    g.setColour (dynamic_cast<te::MidiClip*> (c) ? sw::colour::accent : sw::colour::text2);
+                    g.fillRect (Rectangle<float>::leftTopRightBottom (ovX (c->getPosition().getStart().inSeconds()), ov.getY() + 2 + i * lh,
+                                                                     ovX (c->getPosition().getEnd().inSeconds()) + 1, ov.getY() + 2 + (i + 1) * lh - (lh > 2 ? 1 : 0)));
+                }
+            auto view = Rectangle<float>::leftTopRightBottom (ovX (timeAt ((float) headerW).inSeconds()), ov.getY(),
+                                                              jmin (ov.getRight(), ovX (timeAt ((float) rulerRight()).inSeconds())), ov.getBottom());
+            g.setColour (sw::colour::text); g.drawRoundedRectangle (view.reduced (0.5f), 6.0f, 1.5f);
+            g.setColour (sw::colour::accent); g.fillRect (ovX (edit().getTransport().getPosition().inSeconds()), ov.getY(), 1.5f, ov.getHeight());
+            // loop brace
+            auto& tc = edit().getTransport();
+            auto lr = tc.getLoopRange();
+            auto brace = Rectangle<float>::leftTopRightBottom (jmax ((float) headerW, xFor (lr.getStart())), (float) ovH + 1,
+                                                               jmin ((float) rulerRight(), xFor (lr.getEnd())), (float) (ovH + loopH) - 1);
+            if (brace.getWidth() > 0)
+            {
+                g.setColour (tc.looping.get() ? sw::colour::accent : sw::colour::line); g.fillRoundedRectangle (brace, 5.0f);
+                g.setColour (tc.looping.get() ? sw::colour::card : sw::colour::text2); g.setFont (sw::label (7.5f));
+                g.drawText ("LOOP", brace.toNearestInt(), Justification::centred);
+            }
+        }
         for (int bar = 0; ; ++bar)
         {
             auto x = xFor (ts.toTime (te::tempo::BarsAndBeats { .bars = bar }));
@@ -1200,7 +1254,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             if (x < headerW) continue;
             g.setColour (sw::colour::line); g.drawVerticalLine ((int) x, (float) rulerH, (float) getHeight());
             g.setColour (sw::colour::text2); g.setFont (sw::mono (10.0f));
-            g.drawText (String (bar + 1), (int) x + 4, 0, 40, rulerH, Justification::centredLeft);
+            g.drawText (String (bar + 1), (int) x + 4, ovH + loopH, 40, rulerH - ovH - loopH, Justification::centredLeft);
         }
 
         auto trs = tracks();
@@ -1229,7 +1283,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
                 {
                     auto area = b.reduced (6, 4).withTrimmedTop (14);
                     auto len = jmax (0.25, mc->getLengthInBeats().inBeats());
-                    g.setColour (sw::colour::text);
+                    g.setColour (sw::colour::accent);
                     for (auto n : mc->getSequence().getNotes())
                     {
                         float x = area.getX() + (float) (n->getStartBeat().inBeats() / len) * area.getWidth();
@@ -1348,7 +1402,23 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         auto trs = tracks();
         const int r = rowAt (e.y);
         const bool onLine = e.x >= headerW && std::abs (e.x - xFor (edit().getTransport().getPosition())) < 5;
-        if ((e.y < rulerH && e.x >= headerW) || (onLine && ! e.mods.isPopupMenu()))
+        if (e.y < rulerH && e.x >= headerW && e.x < rulerRight())
+        {
+            auto& tc = edit().getTransport();
+            downT = timeAt ((float) e.x); downPx = pxPerSec; downScroll = scrollX; downLoop = tc.getLoopRange();
+            if (e.y < ovH) { rulerDrag = RulerDrag::overview; mouseDrag (e); return; }
+            if (e.y < ovH + loopH)
+            {
+                const float a = xFor (downLoop.getStart()), b = xFor (downLoop.getEnd());
+                rulerDrag = std::abs (e.x - a) < 6 ? RulerDrag::loopStart : std::abs (e.x - b) < 6 ? RulerDrag::loopEnd
+                          : (e.x > a && e.x < b) ? RulerDrag::loopMove : RulerDrag::loopNew;
+                return;
+            }
+            rulerDrag = RulerDrag::zoom;
+            tc.setPosition (downT);
+            repaint(); return;
+        }
+        if (onLine && ! e.mods.isPopupMenu())
         {
             scrubbing = true;
             edit().getTransport().setPosition (timeAt ((float) jmax (headerW, e.x)));
@@ -1460,6 +1530,9 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     void mouseUp (const MouseEvent& e) override
     {
         scrubbing = false;
+        if (rulerDrag == RulerDrag::loopMove && e.getDistanceFromDragStart() < 4)   // click on the brace: loop on/off
+            edit().getTransport().looping = ! edit().getTransport().looping.get();
+        if (rulerDrag != RulerDrag::none) { rulerDrag = RulerDrag::none; repaint(); return; }
         if (dragTrack < 0) return;
         auto regs = session.regularTracks();
         const int to = jlimit (0, regs.size() - 1, rowAt (e.y));
@@ -1472,6 +1545,50 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
 
     void mouseDrag (const MouseEvent& e) override
     {
+        if (rulerDrag != RulerDrag::none)
+        {
+            auto& tc = edit().getTransport();
+            const bool free = e.mods.isAltDown();
+            switch (rulerDrag)
+            {
+                case RulerDrag::overview:   // centre the view where the mouse is in the whole song
+                {
+                    const double t = (e.x - headerW) / (double) (rulerRight() - headerW) * songLength();
+                    scrollX = jmax (0.0f, (float) (t * pxPerSec) - (rulerRight() - headerW) * 0.5f);
+                    break;
+                }
+                case RulerDrag::zoom:       // Ableton-style: drag down zooms in, sideways scrolls
+                {
+                    pxPerSec = jlimit (4.0, 600.0, downPx * std::exp (e.getDistanceFromDragStartY() * 0.012));
+                    scrollX = jmax (0.0f, (float) (downT.inSeconds() * pxPerSec) - (e.getMouseDownX() - headerW) - e.getDistanceFromDragStartX());
+                    break;
+                }
+                case RulerDrag::loopNew:
+                {
+                    if (std::abs (e.getDistanceFromDragStartX()) < 4) return;
+                    auto a = snapBeat (downT, free), b = snapBeat (timeAt ((float) e.x), free);
+                    if (a != b) tc.setLoopRange ({ a < b ? a : b, a < b ? b : a });
+                    tc.looping = true;
+                    break;
+                }
+                case RulerDrag::loopMove:
+                {
+                    auto d = timeAt ((float) e.x) - downT;
+                    auto start = snapBeat (te::TimePosition::fromSeconds (jmax (0.0, (downLoop.getStart() + d).inSeconds())), free);
+                    tc.setLoopRange ({ start, start + downLoop.getLength() });
+                    break;
+                }
+                case RulerDrag::loopStart: case RulerDrag::loopEnd:
+                {
+                    auto t = snapBeat (timeAt ((float) e.x), free);
+                    auto a = rulerDrag == RulerDrag::loopStart ? t : downLoop.getStart(), b = rulerDrag == RulerDrag::loopEnd ? t : downLoop.getEnd();
+                    if (b > a) tc.setLoopRange ({ a, b });
+                    break;
+                }
+                default: break;
+            }
+            repaint(); return;
+        }
         if (scrubbing) { edit().getTransport().setPosition (timeAt ((float) jmax (headerW, e.x))); repaint(); return; }
         if (dragTrack >= 0) { dropLine = jlimit (0, session.regularTracks().size() - 1, rowAt (e.y)); repaint(); return; }
         if (! selected && rangeRow >= 0 && ! e.mods.isPopupMenu())
@@ -1498,7 +1615,15 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     {
         int row; auto c = clipAt (e.getPosition(), row);
         auto edge = c && (e.x - clipBounds (row, *c).getX() < 7 || clipBounds (row, *c).getRight() - e.x < 7);
-        const bool playhead = e.x >= headerW && (e.y < rulerH || std::abs (e.x - xFor (edit().getTransport().getPosition())) < 5);
+        if (e.y < rulerH && e.x >= headerW && e.x < rulerRight())
+        {
+            auto lr = edit().getTransport().getLoopRange();
+            const bool loopEdge = e.y >= ovH && e.y < ovH + loopH && (std::abs (e.x - xFor (lr.getStart())) < 6 || std::abs (e.x - xFor (lr.getEnd())) < 6);
+            setMouseCursor (e.y < ovH ? MouseCursor::PointingHandCursor : loopEdge ? MouseCursor::LeftRightResizeCursor
+                            : e.y < ovH + loopH ? MouseCursor::NormalCursor : zoomCursor());
+            return;
+        }
+        const bool playhead = e.x >= headerW && std::abs (e.x - xFor (edit().getTransport().getPosition())) < 5;
         setMouseCursor (edge || playhead ? MouseCursor::LeftRightResizeCursor : MouseCursor::NormalCursor);
     }
 
@@ -1969,7 +2094,7 @@ struct PianoRoll : Component
         {
             auto nb = Rectangle<float>::leftTopRightBottom (xFor (n->getStartBeat().inBeats()), yFor (n->getNoteNumber()) + 1,
                                                             xFor (n->getEndBeat().inBeats()) - 1, yFor (n->getNoteNumber()) + rowH - 1);
-            g.setColour (n == dragNote ? sw::colour::accent : sw::colour::text);
+            g.setColour (n == dragNote ? sw::colour::accent.darker (0.35f) : sw::colour::accent);
             g.fillRoundedRectangle (nb, 3.0f);
             g.setColour (sw::colour::card.withAlpha (0.5f));
             g.fillRect (nb.removeFromLeft (3.0f).reduced (0, 2));   // velocity-ish tick
@@ -3188,6 +3313,9 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         session.onChange = [this] { grid.rebuild(); timeline.rebuildIO(); detail.refresh(); };
         session.onSelect = [this] { detail.refresh(); timeline.repaint(); };
         timeline.onMidiClipCreated = [this] { if (! detail.isVisible()) top.panel.triggerClick(); };
+        addChildComponent (splitter);
+        splitter.onDrag = [this] (int dy) { if (dy == 0 || detailDownH == 0) detailDownH = detail.getHeight(); detailH = detailDownH - dy; resized(); };
+        splitter.onDone = [this] { detailDownH = 0; settings().setValue ("detailH", detail.getHeight()); };
         browser.tiles.onChosen = [this] (const PluginDescription& d)   // double-click a plugin: add it to the selected track
         { if (auto t = session.selTrack ? session.selTrack : te::getAudioTracks (*session.edit).getFirst()) { session.insertPlugin (*t, d); session.changed(); } };
         top.onEditingChanged = [this] (bool e) { menu.setVisible (! e); grabKeyboardFocus(); };
@@ -3360,9 +3488,31 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         menu.setBounds (0, 0, 520, TopBar::rowH);
         menu.toFront (false);
         if (browser.isVisible()) browser.setBounds (r.removeFromLeft (290));
-        if (detail.isVisible()) detail.setBounds (r.removeFromBottom (jmin (330, r.getHeight() / 2)));
+        if (detail.isVisible())
+        {
+            detail.setBounds (r.removeFromBottom (jlimit (160, jmax (160, r.getHeight() - 140), detailH)));
+            splitter.setBounds (r.removeFromBottom (8));
+        }
+        splitter.setVisible (detail.isVisible());
         timeline.setBounds (r); grid.setBounds (r);
     }
+
+    // drag the bar between the arrangement and the bottom panel to resize it
+    struct Splitter : Component
+    {
+        std::function<void (int)> onDrag; std::function<void()> onDone;
+        Splitter() { setMouseCursor (MouseCursor::UpDownResizeCursor); }
+        void paint (Graphics& g) override
+        {
+            g.setColour (isMouseOverOrDragging() ? sw::colour::text2 : sw::colour::line);
+            g.fillRoundedRectangle (getLocalBounds().toFloat().withSizeKeepingCentre (46, 4), 2.0f);
+        }
+        void mouseEnter (const MouseEvent&) override { repaint(); }
+        void mouseExit (const MouseEvent&) override { repaint(); }
+        void mouseDrag (const MouseEvent& e) override { if (onDrag) onDrag (e.getDistanceFromDragStartY()); }
+        void mouseUp (const MouseEvent&) override { if (onDone) onDone(); }
+    } splitter;
+    int detailH = settings().getIntValue ("detailH", 330), detailDownH = 0;
 
     AppLook laf;
     MenuBarComponent menu { this };

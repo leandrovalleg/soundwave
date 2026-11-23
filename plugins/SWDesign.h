@@ -122,7 +122,7 @@ struct LookAndFeel : juce::LookAndFeel_V4
         setColour(juce::ComboBox::outlineColourId, line);
         setColour(juce::ComboBox::textColourId, text);
         setColour(juce::ComboBox::arrowColourId, text);
-        setColour(juce::PopupMenu::backgroundColourId, card);
+        setColour(juce::PopupMenu::backgroundColourId, card.withAlpha(0.995f));   // not opaque, so the corners can be round
         setColour(juce::PopupMenu::textColourId, text);
         setColour(juce::PopupMenu::highlightedBackgroundColourId, subtle);
         setColour(juce::PopupMenu::highlightedTextColourId, text);
@@ -289,10 +289,11 @@ struct LookAndFeel : juce::LookAndFeel_V4
     }
     void drawPopupMenuBackground(juce::Graphics& g, int w, int h) override
     {
-        g.fillAll(colour::card);
-        g.setColour(colour::line);
-        g.drawRect(0, 0, w, h, 1);
+        auto r = juce::Rectangle<float>(0, 0, (float) w, (float) h).reduced(0.5f);
+        g.setColour(colour::card); g.fillRoundedRectangle(r, 12.0f);
+        g.setColour(colour::line); g.drawRoundedRectangle(r, 12.0f, 1.0f);
     }
+    int getPopupMenuBorderSize() override { return 6; }
     juce::Font getPopupMenuFont() override { return mono(13.0f); }
     void drawPopupMenuItem(juce::Graphics& g, const juce::Rectangle<int>& area, bool sep, bool active, bool hi, bool ticked,
                            bool sub, const juce::String& text, const juce::String& shortcut, const juce::Drawable*, const juce::Colour*) override
