@@ -2394,7 +2394,7 @@ struct DotButton : TextButton
             case plus     : return "...1......1......1...1111111...1......1......1...";
             case gear     : return "1..1..1.11111..1...1.11...11.1...1..11111.1..1..1";
             case exportUp : return "...1.....111...1.1.1....1......1...1.....11111111";
-            case chevron  : return "..............1.....1.1...1...1.1.....1..........";
+            case chevron  : return ".................................................";   // drawn by hand below
             case metro    : return ".................................................";   // drawn by hand below
             default:       return nullptr;
         }
@@ -2406,7 +2406,8 @@ struct DotButton : TextButton
         const auto col = findColour (getToggleState() ? textColourOnId : textColourOffId);
         const auto font = sw::label (jlimit (9.0f, 11.0f, getHeight() * 0.32f));
         const float textW = (float) GlyphArrangement::getStringWidth (font, getButtonText());
-        const float dot = 1.5f, step = 2.15f, glyphW = rows (glyph) ? step * 7 + 9 : 0;   // small dots, more air
+        const float dot = 1.5f, step = 2.15f;   // small dots, more air
+        const float glyphW = rows (glyph) ? step * 7 + (getButtonText().isEmpty() ? 0.0f : 9.0f) : 0;   // icon-only buttons stay centred
         float x = getWidth() / 2.0f - (glyphW + textW) / 2;
         if (auto* bits = rows (glyph))
         {
@@ -2414,6 +2415,13 @@ struct DotButton : TextButton
             g.setColour (glyph == rec && ! getToggleState() ? sw::colour::accent : col);
             for (int i = 0; i < 49 && bits[i]; ++i)
                 if (bits[i] == '1') g.fillEllipse (x + (i % 7) * step, y0 + (i / 7) * step, dot, dot);
+            if (glyph == chevron)   // compact V of five bold dots
+            {
+                const float d = 2.6f, sp = 3.4f, cx = getWidth() / 2.0f, cy = getHeight() / 2.0f - sp * 0.5f;
+                g.setColour (col);
+                for (auto [dx, dy] : { std::pair { -2, 0 }, { -1, 1 }, { 0, 2 }, { 1, 1 }, { 2, 0 } })
+                    g.fillEllipse (cx + dx * sp - d / 2, cy + dy * sp - d / 2, d, d);
+            }
             if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
             {
                 const float d = step * 2.4f, cy = getHeight() / 2.0f;
