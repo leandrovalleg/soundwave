@@ -1198,11 +1198,12 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         scrollY = jlimit (0, maxScroll, scrollY + dy);
         resized(); repaint();
     }
-    Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).reduced (12, 0).withTrimmedTop (jmin (38, rowH - 30)).withHeight (20).withWidth (24); }
-    Rectangle<int> soloBox (int i) const { return muteBox (i).translated (28, 0); }
-    Rectangle<int> fxBox (int i)   const { return muteBox (i).translated (56, 0).withWidth (36); }
-    Rectangle<int> armBox (int i)  const { return muteBox (i).translated (96, 0); }
-    Rectangle<int> inBox (int i)   const { return armBox (i).translated (28, 0).withWidth (48); }
+    // header buttons, all inside the card (card spans x 8..182)
+    Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).withTrimmedLeft (18).withTrimmedTop (jmin (38, rowH - 30)).withHeight (20).withWidth (22); }
+    Rectangle<int> soloBox (int i) const { return muteBox (i).translated (26, 0); }
+    Rectangle<int> fxBox (int i)   const { return muteBox (i).translated (52, 0).withWidth (34); }
+    Rectangle<int> armBox (int i)  const { return muteBox (i).translated (90, 0); }
+    Rectangle<int> inBox (int i)   const { return armBox (i).translated (26, 0).withWidth (40); }
 
     Rectangle<float> clipBounds (int row, te::Clip& c) const
     {
@@ -1316,22 +1317,32 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
                 }
 
             auto h = row.withWidth (headerW).reduced (8, 6).toFloat();
-            sw::paintCard (g, h, 12.0f);
+            const bool sel = t == session.selTrack.get();   // the selected track turns black
+            const Colour ink = sel ? sw::colour::card : sw::colour::text, ink2 = sel ? sw::colour::card.withAlpha (0.6f) : sw::colour::text2;
+            if (sel) { g.setColour (sw::colour::text); g.fillRoundedRectangle (h, 12.0f); }
+            else sw::paintCard (g, h, 12.0f);
             if (Session::returnBus (*t) < 0)   // type stripe: red = MIDI track, black = audio track
             {
-                g.setColour (Session::isMidiTrack (*t) ? sw::colour::accent : sw::colour::text);
+                g.setColour (Session::isMidiTrack (*t) ? sw::colour::accent : ink);
                 g.fillRoundedRectangle (h.getX() + 2.0f, h.getY() + 10, 2.5f, h.getHeight() - 20, 1.25f);
             }
-            g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
             const int rb = Session::returnBus (*t);
-            if (rb >= 0) { g.setColour (sw::colour::accent); g.fillEllipse (h.getRight() - 18, h.getY() + 10, 7, 7); g.setColour (sw::colour::text); }
+            auto titleRow = h.reduced (10, 6).removeFromTop (20).toNearestInt();
+            auto inst = Session::instrumentOf (*t);
+            if (rb >= 0) { g.setColour (sw::colour::accent); g.fillEllipse (h.getRight() - 18, h.getY() + 10, 7, 7); titleRow.removeFromRight (14); }
+            if (inst)   // instrument name gets its own space on the right, the title never runs under it
+            {
+                g.setColour (sw::colour::accent); g.setFont (sw::label (8.0f));
+                g.drawText (inst->getName().toUpperCase().substring (0, 10), titleRow.removeFromRight (58), Justification::centredRight);
+            }
+            g.setColour (ink); g.setFont (sw::display (16.0f));
             g.drawText ((rb >= 0 ? String ("RET") : String (i + 1).paddedLeft ('0', 2)) + "  " + t->getName().toUpperCase(),
-                        h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredLeft, true);
+                        titleRow, Justification::centredLeft, true);
             auto drawToggle = [&] (Rectangle<int> r, const String& s, bool on, bool red)
             {
-                g.setColour (on ? (red ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
+                g.setColour (on ? (red ? sw::colour::accent : ink) : sel ? sw::colour::card.withAlpha (0.14f) : sw::colour::subtle);
                 g.fillRoundedRectangle (r.toFloat(), 10.0f);
-                g.setColour (on ? sw::colour::card : sw::colour::text2); g.setFont (sw::mono (10.0f));
+                g.setColour (on ? (sel && ! red ? sw::colour::text : sw::colour::card) : ink2); g.setFont (sw::mono (10.0f));
                 g.drawText (s, r, Justification::centred);
             };
             drawToggle (muteBox (i), "M", t->isMuted (false), false);
@@ -1341,14 +1352,9 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             {
                 drawToggle (armBox (i), "o", session.isArmed (*t), true);
                 auto in = session.inputOf (*t);
-                g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
-                g.drawText (in ? (Session::isMidiIn (in) ? "MIDI" : "IN " + in->getInputDevice().getName().getLastCharacters (3).trim()) : "NO IN",
-                            inBox (i), Justification::centredLeft);
-            }
-            if (auto inst = Session::instrumentOf (*t))
-            {
-                g.setColour (sw::colour::accent); g.setFont (sw::label (8.0f));
-                g.drawText (inst->getName().toUpperCase().substring (0, 12), h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredRight);
+                g.setColour (ink2); g.setFont (sw::label (8.0f));
+                g.drawFittedText (in ? (Session::isMidiIn (in) ? "MIDI" : "IN " + in->getInputDevice().getName().getLastCharacters (3).trim()) : "NO IN",
+                                  inBox (i), Justification::centredLeft, 1, 0.7f);
             }
         }
 
