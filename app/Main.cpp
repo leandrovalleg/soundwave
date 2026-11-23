@@ -92,10 +92,15 @@ namespace launch
 // Engine UI hooks: plugin windows + running render jobs (export).
 struct SWBehaviour : ExtendedUIBehaviour
 {
-    // ponytail: runs to completion on the calling thread, no progress bar; add one if exports get long
+    // Runs the job on its own thread while the message loop keeps going (the render needs it).
+    // ponytail: no progress bar yet; the window just waits
     void runTaskWithProgressBar (te::ThreadPoolJobWithProgress& job) override
     {
-        while (job.runJob() == ThreadPoolJob::jobNeedsRunningAgain) {}
+        std::atomic<bool> done { false };
+        std::thread worker ([&] { while (job.runJob() == ThreadPoolJob::jobNeedsRunningAgain) {} done = true; });
+        while (! done)
+            MessageManager::getInstance()->runDispatchLoopUntil (10);
+        worker.join();
     }
 };
 
