@@ -660,9 +660,8 @@ static const StringArray pluginTypes { "TODOS", "SINTE", String::fromUTF8 ("DIN�
 struct PluginTiles : Component
 {
     std::vector<std::pair<String, Array<PluginDescription>>> groups;
-    std::function<void (const PluginDescription&)> onChosen;
     String hoverId, selectedId;
-    static constexpr int headerH = 22, tileH = 64, gap = 6, cols = 3;
+    static constexpr int headerH = 28, tileH = 78, gap = 8, cols = 2;
 
     void setGroups (decltype (groups) g)
     {
@@ -709,7 +708,8 @@ struct PluginTiles : Component
         for (auto& [maker, list] : groups)
         {
             g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
-            g.drawText (maker.toUpperCase() + "  (" + String (list.size()) + ")", 2, y, getWidth(), headerH - 4, Justification::bottomLeft);
+            g.drawText (maker.toUpperCase(), 2, y, getWidth(), headerH - 8, Justification::bottomLeft);
+            g.setColour (sw::colour::line); g.fillRect (2, y + headerH - 5, getWidth() - 4, 1);
             y += headerH + ((list.size() + cols - 1) / cols) * (tileH + gap) + 6;
         }
         forEachTile ([&] (const PluginDescription& d, Rectangle<int> r)
@@ -724,25 +724,35 @@ struct PluginTiles : Component
             {
                 g.setColour (sel ? sw::colour::card : native ? sw::colour::accent : sw::colour::text);
                 for (int i = 0; i < 25; ++i)
-                    if (bits[i] == '1') g.fillRoundedRectangle (r.getX() + 9 + (i % 5) * 3.0f, r.getY() + 9 + (i / 5) * 3.0f, 2.2f, 2.2f, 0.7f);
+                    if (bits[i] == '1') g.fillRoundedRectangle (r.getX() + 12 + (i % 5) * 4.0f, r.getY() + 12 + (i / 5) * 4.0f, 3.0f, 3.0f, 1.0f);
             }
-            g.setColour (sel ? sw::colour::card : sw::colour::text); g.setFont (sw::mono (10.5f));
+            g.setColour (sel ? sw::colour::card : sw::colour::text); g.setFont (sw::mono (12.0f));
             auto name = d.name.startsWith ("SW ") ? d.name.substring (3) : d.name;
-            g.drawFittedText (name.toUpperCase(), r.reduced (9, 0).withTrimmedTop (26).withHeight (24), Justification::topLeft, 2, 1.0f);
-            g.setColour (sel ? sw::colour::card.withAlpha (0.7f) : sw::colour::text2); g.setFont (sw::label (7.5f));
-            g.drawText (type, r.reduced (9, 6).removeFromBottom (10), Justification::bottomLeft);
+            g.drawFittedText (name.toUpperCase(), r.reduced (12, 0).withTrimmedTop (38).withHeight (18), Justification::centredLeft, 1, 0.8f);
+            g.setColour (sel ? sw::colour::card.withAlpha (0.7f) : sw::colour::text2); g.setFont (sw::label (8.0f));
+            g.drawText (type, r.reduced (12, 8).removeFromBottom (11), Justification::bottomLeft);
         });
     }
-    void mouseMove (const MouseEvent& e) override { auto* d = tileAt (e.getPosition()); auto id = d ? d->createIdentifierString() : String(); if (id != hoverId) { hoverId = id; repaint(); } }
+    void mouseMove (const MouseEvent& e) override
+    {
+        auto* d = tileAt (e.getPosition()); auto id = d ? d->createIdentifierString() : String();
+        setMouseCursor (d ? MouseCursor::DraggingHandCursor : MouseCursor::NormalCursor);
+        if (id != hoverId) { hoverId = id; repaint(); }
+    }
     void mouseExit (const MouseEvent&) override { hoverId = {}; repaint(); }
     void mouseDown (const MouseEvent& e) override { if (auto* d = tileAt (e.getPosition())) { selectedId = d->createIdentifierString(); repaint(); } }
-    void mouseDoubleClick (const MouseEvent& e) override { if (auto* d = tileAt (e.getPosition())) if (onChosen) onChosen (*d); }
     void mouseDrag (const MouseEvent& e) override
     {
         if (e.getDistanceFromDragStart() < 6) return;
         if (auto* d = tileAt (e.getMouseDownPosition()))
             if (auto* dc = DragAndDropContainer::findParentDragContainerFor (this); dc && ! dc->isDragAndDropActive())
-                dc->startDragging ("swplugin:" + d->createIdentifierString(), this);
+            {
+                Rectangle<int> tile; forEachTile ([&] (const PluginDescription& o, Rectangle<int> r) { if (&o == d) tile = r; });
+                auto img = createComponentSnapshot (tile, true, 2.0f);
+                img.multiplyAllAlphas (0.85f);
+                dc->startDragging ("swplugin:" + d->createIdentifierString(), this, ScaledImage (img, 2.0),
+                                   false, nullptr, &e.source);
+            }
     }
 };
 
@@ -757,12 +767,9 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         }
         tabSamples.setToggleState (true, dontSendNotification);
         // plugin section: search, ALL/INST/FX, type filter, tiles
-        search.setTextToShowWhenEmpty ("BUSCAR PLUGIN...", sw::colour::text2);
+        search.setTextToShowWhenEmpty ("BUSCAR", sw::colour::text2); search.setIndents (12, 7);
         search.setFont (sw::mono (12.0f));
         search.onTextChange = [this] { refreshPlugins(); };
-        for (auto* b : { &kindAll, &kindInst, &kindFx })
-        { b->setRadioGroupId (8); b->setClickingTogglesState (true); b->onClick = [this] { refreshPlugins(); }; addChildComponent (b); }
-        kindAll.setToggleState (true, dontSendNotification);
         typeFilter.addItemList (pluginTypes, 1); typeFilter.setSelectedId (1, dontSendNotification);
         typeFilter.onChange = [this] { refreshPlugins(); };
         tilesView.setViewedComponent (&tiles, false); tilesView.setScrollBarsShown (true, false);
@@ -798,8 +805,6 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         for (auto& d : known.getTypes())
         {
             if (nativeOnly && d.manufacturerName != "SoundWave") continue;
-            if (kindInst.getToggleState() && ! d.isInstrument) continue;
-            if (kindFx.getToggleState() && d.isInstrument) continue;
             if (type.isNotEmpty() && pluginType (d) != type) continue;
             if (q.isNotEmpty() && ! (d.name + " " + d.manufacturerName).toLowerCase().contains (q)) continue;
             byMaker[d.manufacturerName.isEmpty() ? String ("?") : d.manufacturerName].add (d);
@@ -814,7 +819,7 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         tiles.setGroups (std::move (groups));
         const bool s = samplesTab();
         for (auto* c : { (Component*) &tree, (Component*) &folders, (Component*) &add, (Component*) &remove, (Component*) &previewToggle }) c->setVisible (s);
-        for (auto* c : { (Component*) &search, (Component*) &typeFilter, (Component*) &tilesView, (Component*) &kindAll, (Component*) &kindInst, (Component*) &kindFx })
+        for (auto* c : { (Component*) &search, (Component*) &typeFilter, (Component*) &tilesView })
             c->setVisible (! s);
         repaint();
     }
@@ -890,7 +895,7 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         if (! samplesTab())
         {
             if (shown.isEmpty()) sw::paintCaption (g, search.isEmpty() ? "SCANNING PLUGINS..." : "NADA ENCONTRADO", tilesView.getBounds().withHeight (30), Justification::centred);
-            else sw::paintCaption (g, String::fromUTF8 ("ARRASTRA A UNA PISTA · DOBLE CLIC = AÑADIR"), tilesView.getBounds().withY (tilesView.getBottom() + 4).withHeight (16), Justification::centredLeft);
+            else sw::paintCaption (g, String::fromUTF8 ("ARRASTRA UN PLUGIN A UNA PISTA"), tilesView.getBounds().withY (tilesView.getBottom() + 4).withHeight (16), Justification::centredLeft);
             return;
         }
         sw::paintCaption (g, "PLACES", getLocalBounds().reduced (28).withTrimmedTop (64).removeFromTop (14));
@@ -909,13 +914,9 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         r.removeFromTop (8);
         {   // plugin section
             auto p = r.withTrimmedBottom (22);
-            search.setBounds (p.removeFromTop (26)); p.removeFromTop (6);
-            auto row = p.removeFromTop (22);
-            const int kw = 44;
-            kindAll.setBounds (row.removeFromLeft (kw)); row.removeFromLeft (3);
-            kindInst.setBounds (row.removeFromLeft (kw)); row.removeFromLeft (3);
-            kindFx.setBounds (row.removeFromLeft (kw)); row.removeFromLeft (6);
-            typeFilter.setBounds (row);
+            auto row = p.removeFromTop (28);
+            typeFilter.setBounds (row.removeFromRight (104)); row.removeFromRight (6);
+            search.setBounds (row);
             p.removeFromTop (6);
             tilesView.setBounds (p);
             tiles.setSize (jmax (100, p.getWidth() - 10), tiles.getHeight());
@@ -936,7 +937,6 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
     KnownPluginList& known;
     Array<PluginDescription> shown;
     TextEditor search; ComboBox typeFilter;
-    Pill kindAll { "ALL" }, kindInst { "INST" }, kindFx { "FX" };
     Viewport tilesView; PluginTiles tiles;
     Pill tabSamples { "SAMPLES" }, tabInst { "PLUGINS" }, tabFx { "SOUNDWAVE" };
     Pill& tabNative = tabFx;
@@ -3317,8 +3317,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         addChildComponent (splitter);
         splitter.onDrag = [this] (int dy) { if (dy == 0 || detailDownH == 0) detailDownH = detail.getHeight(); detailH = detailDownH - dy; resized(); };
         splitter.onDone = [this] { detailDownH = 0; settings().setValue ("detailH", detail.getHeight()); };
-        browser.tiles.onChosen = [this] (const PluginDescription& d)   // double-click a plugin: add it to the selected track
-        { if (auto t = session.selTrack ? session.selTrack : te::getAudioTracks (*session.edit).getFirst()) { session.insertPlugin (*t, d); session.changed(); } };
+
         top.onEditingChanged = [this] (bool e) { menu.setVisible (! e); grabKeyboardFocus(); };
         session.onPluginsScanned = [this] { browser.refreshPlugins(); };
         browser.refreshPlugins();
