@@ -29,16 +29,17 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
-      - name: Build SoundWave app
-        run: |
-          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build app/build
-
       - name: Build MP3 encoder (LAME, LGPL)
         shell: bash
         run: |
           "$VCPKG_INSTALLATION_ROOT/vcpkg" install mp3lame:x64-windows
-          ls "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin"
+          dll=$(ls "$VCPKG_INSTALLATION_ROOT"/installed/x64-windows/bin/*mp3lame*.dll | head -1)
+          cp "$dll" "$GITHUB_WORKSPACE/libmp3lame.dll"
+
+      - name: Build SoundWave app
+        run: |
+          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSW_LAME_LIB="$env:GITHUB_WORKSPACE/libmp3lame.dll"
+          cmake --build app/build
 
       - name: Package
         shell: bash
@@ -47,9 +48,7 @@ jobs:
           cp app/build/SoundWave_artefacts/Release/SoundWave.exe dist/SoundWave/
           cp -r build/*_artefacts/Release/VST3/*.vst3 dist/VST3/
           cp LICENSE README.md dist/
-          dll=$(ls "$VCPKG_INSTALLATION_ROOT"/installed/x64-windows/bin/*mp3lame*.dll | head -1)
-          cp "$dll" dist/SoundWave/libmp3lame.dll
-          cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/share/mp3lame/copyright" dist/SoundWave/LAME-LICENSE.txt || true
+          cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/share/mp3lame/copyright" dist/LAME-LICENSE.txt || true
 
       - uses: actions/upload-artifact@v4
         with:

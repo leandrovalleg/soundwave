@@ -4,7 +4,7 @@ DAW minimalista y colección de plugins VST3 propios. Código abierto bajo GPLv3
 
 ## Descargar para Windows
 GitHub → pestaña **Actions** → último "Windows build" → **Artifacts** → `SoundWave-windows` (zip).
-- `SoundWave/SoundWave.exe` — la app (MP3 incluido, no hay que instalar nada).
+- `SoundWave/SoundWave.exe` — la app, un solo archivo (el codificador MP3 va dentro).
 - `VST3/*.vst3` — copia estas carpetas a `C:\Program Files\Common Files\VST3`.
 
 ## Contenido
