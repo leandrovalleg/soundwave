@@ -757,7 +757,7 @@ struct PluginTiles : Component
     }
 };
 
-struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxModel, ChangeListener
+struct Browser : Component, FileBrowserListener, ListBoxModel, ChangeListener   // drags go through MainComponent, so they can reach the tracks
 {
     Browser (Previewer& pv, KnownPluginList& kl) : preview (pv), known (kl)
     {
@@ -1123,17 +1123,21 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     int rulerRight() const { return getWidth() - 56; }
     double songLength() { return jmax (60.0, edit().getLength().inSeconds() * 1.1, timeAt ((float) rulerRight()).inSeconds()); }
     float ovX (double t) { return headerW + (float) (t / songLength()) * (rulerRight() - headerW); }
-    static const MouseCursor& zoomCursor()   // dot magnifier, like everything else
+    static const MouseCursor& zoomCursor()   // dot magnifier drawn at 2x so it stays sharp on HiDPI screens
     {
         static MouseCursor c = []
         {
-            Image im (Image::ARGB, 22, 22, true); Graphics g (im);
+            Image im (Image::ARGB, 48, 48, true); Graphics g (im);
             const char* bits[] = { "..111...", ".1...1..", "1.....1.", "1.....1.", "1.....1.", ".1...1..", "..111.1.", ".......1" };
-            for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x)
-                if (bits[y][x] == '1') { g.setColour (Colours::white); g.fillRect (x * 2.5f - 0.5f, y * 2.5f - 0.5f, 3.0f, 3.0f); }
-            for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x)
-                if (bits[y][x] == '1') { g.setColour (sw::colour::text); g.fillRect (x * 2.5f, y * 2.5f, 2.0f, 2.0f); }
-            return MouseCursor (im, 7, 7);
+            for (int pass = 0; pass < 2; ++pass)   // white halo first, then the black dots
+                for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x)
+                    if (bits[y][x] == '1')
+                    {
+                        g.setColour (pass == 0 ? Colours::white : sw::colour::text);
+                        const float d = pass == 0 ? 7.0f : 4.6f, cx = 4 + x * 5.2f, cy = 4 + y * 5.2f;
+                        g.fillEllipse (cx - d / 2, cy - d / 2, d, d);
+                    }
+            return MouseCursor (ScaledImage (im, 2.0), Point<int> (8, 8));
         }();
         return c;
     }
@@ -2368,7 +2372,7 @@ struct AudioClipEditor : Component, ChangeListener
 struct DotButton : TextButton, Timer
 {
     // 8-bit hover: the glyph is redrawn column by column, a red column sweeping left to right in steps
-    int animStep = -1;   // -1 idle, 0..7 sweeping
+    int animStep = -1;   // -1 idle, 0..11 hover animation (each icon has its own)
     // Optional options arrow inside the button (right edge): click it, or right-click anywhere, to open the menu
     std::function<void()> onMenu;
     static constexpr int menuW = 16;
@@ -2378,7 +2382,7 @@ struct DotButton : TextButton, Timer
         TextButton::mouseDown (e);
     }
     void mouseEnter (const MouseEvent& e) override { TextButton::mouseEnter (e); animStep = 0; startTimer (38); repaint(); }
-    void timerCallback() override { if (++animStep > 7) { animStep = -1; stopTimer(); } repaint(); }
+    void timerCallback() override { if (++animStep > 11) { animStep = -1; stopTimer(); } repaint(); }
 
     enum Glyph { none, play, stop, rec, loop, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro, power, window, arrowL, arrowR, dup, cross };
     enum class OnStyle { grey, redSoft, redSolid };
@@ -2462,20 +2466,39 @@ struct DotButton : TextButton, Timer
             const float y0 = getHeight() / 2.0f - step * 3.5f;
             // one colour per icon: REC is red, the rest take the button's ink (black, red or white when pressed)
             const Colour ink = (glyph == rec || glyph == cross) && ! on ? C::accent : main;
+            // hover: every icon builds itself its own way (play slides in, rec grows from the centre, loop spins,
+            // export rises...); the dots that just appeared pop a little bigger and lighter
+            const float t = animStep < 0 ? 1.0f : animStep / 11.0f;
             for (int i = 0; i < 49 && bits[i]; ++i)
             {
                 if (bits[i] == '.') continue;
-                const int column = i % 7;
-                if (animStep >= 0 && column > animStep) continue;        // 8-bit hover: drawn column by column
-                g.setColour (animStep >= 0 && column == animStep ? ink.withAlpha (0.45f) : ink);
-                square (x + (i % 7) * step, y0 + (i / 7) * step, dot);
+                const int c = i % 7, r = i / 7;
+                const float dist = std::sqrt ((float) ((c - 3) * (c - 3) + (r - 3) * (r - 3)));
+                float k;
+                switch (glyph)
+                {
+                    case play: case arrowR: case chevron: k = c / 6.0f; break;
+                    case arrowL:                          k = (6 - c) / 6.0f; break;
+                    case exportUp:                        k = (6 - r) / 6.0f; break;
+                    case rec: case power: case metro: case gear: case plus: case cross: k = dist / 4.25f; break;
+                    case loop:                            k = (std::atan2 ((float) r - 3, (float) c - 3) + MathConstants<float>::pi) / MathConstants<float>::twoPi; break;
+                    case dup: case window:                k = (float) ((i * 37 + 11) % 49) / 48.0f; break;   // sparkle
+                    case stop:                            k = 1.0f - dist / 4.25f; break;                    // closes in from the edges
+                    default:                              k = (c + r) / 12.0f; break;                        // diagonal wipe
+                }
+                k *= 0.82f;
+                if (animStep >= 0 && k > t) continue;
+                const float pop = animStep >= 0 ? jlimit (0.0f, 1.0f, 1.0f - (t - k) * 6.0f) : 0.0f;
+                const float d = dot * (1.0f + 0.4f * pop), lift = glyph == exportUp ? pop * step * 0.8f : 0.0f;
+                g.setColour (ink.withAlpha (1.0f - 0.45f * pop));
+                square (x + c * step - (d - dot) / 2, y0 + r * step - (d - dot) / 2 - lift, d);
             }
             if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
             {
                 const float d = step * 2.4f, cy = getHeight() / 2.0f;
                 // both dots share one colour: red on beat 1, black otherwise; the dot for the current beat is full, the other faint
                 const Colour ink = beatLight == 1 ? (on ? main : C::accent) : main;
-                const bool hideR = animStep >= 0 && animStep < 4;
+                const bool hideR = animStep >= 0 && animStep < 6;
                 g.setColour (beatLight == 2 ? ink.withAlpha (0.3f) : ink);
                 square (x + step * 0.2f, cy - d / 2, d);
                 if (! hideR) { g.setColour (beatLight == 1 ? ink.withAlpha (0.3f) : ink); square (x + step * 4.0f, cy - d / 2, d); }
@@ -2515,8 +2538,8 @@ struct DeviceChain : Component
                 k->onValueChange = [param, k] { param->setNormalisedParameter ((float) k->getValue(), sendNotification); };
                 addAndMakeVisible (k);
                 auto* l = names.add (new Label ({}, param->getParameterName().toUpperCase().substring (0, 10)));
-                l->setFont (sw::label (9.0f)); l->setJustificationType (Justification::centred);
-                l->setColour (Label::textColourId, sw::colour::text2);
+                l->setFont (sw::label (11.5f)); l->setJustificationType (Justification::centred); l->setMinimumHorizontalScale (0.75f);
+                l->setColour (Label::textColourId, sw::colour::text);
                 addAndMakeVisible (l);
             }
         }
@@ -2568,10 +2591,10 @@ struct DeviceChain : Component
             auto r = getLocalBounds().toFloat().reduced (3);
             sw::paintCard (g, r, 14.0f);
             g.setColour (plugin->isEnabled() ? sw::colour::text : sw::colour::text2);
-            g.setFont (sw::display (15.0f));
+            g.setFont (sw::display (17.0f));
             g.drawText (plugin->getName().toUpperCase(), r.reduced (12, 8).removeFromTop (20).toNearestInt(), Justification::centredLeft);
-            g.setColour (plugin->isSynth() ? sw::colour::accent : sw::colour::text2); g.setFont (sw::label (9.0f));
-            g.drawText (plugin->isSynth() ? "INSTRUMENT" : "EFFECT", r.reduced (12, 8).withTrimmedTop (20).removeFromTop (12).toNearestInt(), Justification::centredLeft);
+            g.setColour (plugin->isSynth() ? sw::colour::accent : sw::colour::text2); g.setFont (sw::label (10.0f));
+            g.drawText (plugin->isSynth() ? "INSTRUMENT" : "EFFECT", r.reduced (12, 8).withTrimmedTop (21).removeFromTop (13).toNearestInt(), Justification::centredLeft);
         }
         void resized() override
         {
