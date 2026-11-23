@@ -115,6 +115,16 @@ struct Session
     std::unique_ptr<te::Edit> edit;
     File editFile = File::getSpecialLocation (File::userDocumentsDirectory).getChildFile ("SoundWave/Untitled.tracktionedit");
     std::function<void()> onChange;   // structure changed (tracks/clips/plugins)
+    std::function<void()> onSelect;   // selected track/clip changed
+    te::AudioTrack::Ptr selTrack;
+    te::Clip::Ptr selClip;
+    void select (te::AudioTrack* t, te::Clip* c)
+    {
+        if (t == selTrack.get() && c == selClip.get()) return;
+        selTrack = t; selClip = c;
+        if (onSelect) onSelect();
+    }
+    static bool alive (te::Clip* c) { return c && c->state.getParent().isValid(); }
 
     Session()
     {
@@ -128,6 +138,7 @@ struct Session
 
     void prepareSlots()
     {
+        ensureReturns(); ensureSends();
         edit->getSceneList().ensureNumberOfScenes (NumScenes);
         for (auto t : te::getAudioTracks (*edit)) t->getClipSlotList().ensureNumberOfSlots (NumScenes);
     }
@@ -189,9 +200,8 @@ struct Session
             routeMidiTo (t);
         }
         else
-            t.pluginList.insertPlugin (p, jmax (0, t.pluginList.indexOf (t.getVolumePlugin())), nullptr);
-        p->showWindowExplicitly();
-        changed();
+            t.pluginList.insertPlugin (p, firstSendIndex (t), nullptr);
+        changed();   // shows up in DEVICES; OPEN shows its window
     }
 
     // Every MIDI keyboard plays this track (like arming it), with live monitoring on.
@@ -240,12 +250,66 @@ struct Session
     std::atomic<bool> stopScan { false };
     std::unique_ptr<std::thread> scanThread;
 
+    // Plugins the user put on the track (not the track's own volume/meter/send/return plumbing)
+    static bool isUserPlugin (te::Plugin* p)
+    {
+        return ! dynamic_cast<te::VolumeAndPanPlugin*> (p) && ! dynamic_cast<te::LevelMeterPlugin*> (p)
+            && ! dynamic_cast<te::AuxSendPlugin*> (p) && ! dynamic_cast<te::AuxReturnPlugin*> (p);
+    }
     static Array<te::Plugin*> userPlugins (te::AudioTrack& t)
     {
         Array<te::Plugin*> out;
-        for (auto p : t.pluginList)
-            if (dynamic_cast<te::ExternalPlugin*> (p)) out.add (p);
+        for (auto p : t.pluginList) if (isUserPlugin (p)) out.add (p);
         return out;
+    }
+    // Effects go before the sends (post-FX sends), sends before the volume.
+    static int firstSendIndex (te::AudioTrack& t)
+    {
+        for (int i = 0; i < t.pluginList.size(); ++i)
+            if (dynamic_cast<te::AuxSendPlugin*> (t.pluginList[i]) || t.pluginList[i] == t.getVolumePlugin()) return i;
+        return t.pluginList.size();
+    }
+
+    // ---- return tracks A (reverb) and B (delay), and a send to each from every track
+    static int returnBus (te::AudioTrack& t) { return (int) t.state.getProperty ("swReturn", -1); }
+    Array<te::AudioTrack*> regularTracks() { auto a = te::getAudioTracks (*edit); a.removeIf ([] (auto* t) { return returnBus (*t) >= 0; }); return a; }
+    Array<te::AudioTrack*> returnTracks()  { auto a = te::getAudioTracks (*edit); a.removeIf ([] (auto* t) { return returnBus (*t) < 0; }); return a; }
+    Array<te::AudioTrack*> orderedTracks() { auto a = regularTracks(); a.addArray (returnTracks()); return a; }
+
+    static te::AuxSendPlugin* sendOf (te::AudioTrack& t, int bus)
+    {
+        for (auto p : t.pluginList) if (auto s = dynamic_cast<te::AuxSendPlugin*> (p); s && s->getBusNumber() == bus) return s;
+        return nullptr;
+    }
+
+    void ensureReturns()
+    {
+        const char* names[] { "A REVERB", "B DELAY" };
+        for (int bus : { 0, 1 })
+        {
+            if (! returnTracks().isEmpty() && std::any_of (returnTracks().begin(), returnTracks().end(), [bus] (auto* t) { return returnBus (*t) == bus; }))
+                continue;
+            auto t = edit->insertNewAudioTrack (te::TrackInsertPoint (nullptr, te::getAllTracks (*edit).getLast()), nullptr);
+            if (! t) continue;
+            t->setName (names[bus]);
+            t->state.setProperty ("swReturn", bus, nullptr);
+            if (auto r = dynamic_cast<te::AuxReturnPlugin*> (edit->getPluginCache().createNewPlugin (te::AuxReturnPlugin::xmlTypeName, {}).get()))
+            { r->busNumber = bus; t->pluginList.insertPlugin (r, 0, nullptr); }
+            auto fx = edit->getPluginCache().createNewPlugin (bus == 0 ? te::ReverbPlugin::xmlTypeName : te::DelayPlugin::xmlTypeName, {});
+            if (fx) t->pluginList.insertPlugin (fx, 1, nullptr);
+        }
+    }
+
+    void ensureSends()
+    {
+        for (auto t : regularTracks())
+            for (int bus : { 0, 1 })
+                if (! sendOf (*t, bus))
+                    if (auto s = dynamic_cast<te::AuxSendPlugin*> (edit->getPluginCache().createNewPlugin (te::AuxSendPlugin::xmlTypeName, {}).get()))
+                    {
+                        s->busNumber = bus; s->setGainDb (-100.0f);
+                        t->pluginList.insertPlugin (s, jmax (0, t->pluginList.indexOf (t->getVolumePlugin())), nullptr);
+                    }
     }
 };
 
@@ -471,21 +535,70 @@ static bool dropPlugin (Session& s, const String& desc, std::function<te::AudioT
 }
 
 //==============================================================================
-// TIMELINE: horizontal arrangement
-struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
+// Waveforms: one thumbnail per audio file, shared by every clip that uses it
+struct Waveforms
 {
-    static constexpr int headerW = 190, rowH = 70, rulerH = 28;
+    Waveforms() { formats.registerBasicFormats(); }
+    AudioThumbnail& get (const File& f, ChangeListener* l)
+    {
+        auto& t = thumbs[f.getFullPathName()];
+        if (! t)
+        {
+            t = std::make_unique<AudioThumbnail> (256, formats, cache);
+            t->setSource (new FileInputSource (f));
+            t->addChangeListener (l);
+        }
+        return *t;
+    }
+    // ponytail: draws source time only (ignores warp/reverse/pitch); good enough to see hits and silences
+    void draw (Graphics& g, te::Clip& c, Rectangle<float> r, ChangeListener* l)
+    {
+        auto w = dynamic_cast<te::WaveAudioClip*> (&c);
+        if (! w) return;
+        auto& t = get (w->getOriginalFile(), l);
+        if (t.getTotalLength() <= 0) return;
+        auto off = c.getPosition().getOffset().inSeconds() * c.getSpeedRatio();
+        auto len = c.getPosition().getLength().inSeconds() * c.getSpeedRatio();
+        t.drawChannels (g, r.toNearestInt(), off, off + len, Decibels::decibelsToGain (w->getGainDB()));
+    }
+    AudioFormatManager formats;
+    AudioThumbnailCache cache { 64 };
+    std::map<String, std::unique_ptr<AudioThumbnail>> thumbs;
+};
 
-    Timeline (Session& s) : session (s) { startTimerHz (30); }
+//==============================================================================
+// TIMELINE: horizontal arrangement
+struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, ChangeListener
+{
+    static constexpr int headerW = 190, rulerH = 28;
+    int rowH = 70;
+
+    Timeline (Session& s) : session (s)
+    {
+        startTimerHz (30);
+        for (auto* b : { &zOut, &zIn, &hOut, &hIn }) addAndMakeVisible (b);
+        zIn.onClick  = [this] { pxPerSec = jmin (600.0, pxPerSec * 1.4); repaint(); };
+        zOut.onClick = [this] { pxPerSec = jmax (4.0, pxPerSec / 1.4); repaint(); };
+        hIn.onClick  = [this] { rowH = jmin (220, rowH + 20); repaint(); };
+        hOut.onClick = [this] { rowH = jmax (44, rowH - 20); repaint(); };
+    }
+    void changeListenerCallback (ChangeBroadcaster*) override { repaint(); }
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (10).removeFromBottom (26).removeFromRight (4 * 40 + 30);
+        for (auto* b : { &zOut, &zIn }) { b->setBounds (r.removeFromLeft (40)); r.removeFromLeft (4); }
+        r.removeFromLeft (18);
+        for (auto* b : { &hOut, &hIn }) { b->setBounds (r.removeFromLeft (40)); r.removeFromLeft (4); }
+    }
 
     te::Edit& edit() { return *session.edit; }
-    Array<te::AudioTrack*> tracks() { return te::getAudioTracks (edit()); }
+    Array<te::AudioTrack*> tracks() { return session.orderedTracks(); }
 
     float xFor (te::TimePosition t) const { return headerW + (float) (t.inSeconds() * pxPerSec) - scrollX; }
     te::TimePosition timeAt (float x) const { return te::TimePosition::fromSeconds (jmax (0.0, (x - headerW + scrollX) / pxPerSec)); }
     int rowAt (int y) const { return (y - rulerH) / rowH; }
     Rectangle<int> rowBounds (int i) const { return { 0, rulerH + i * rowH, getWidth(), rowH }; }
-    Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).reduced (12, 0).withTrimmedTop (38).withHeight (20).withWidth (24); }
+    Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).reduced (12, 0).withTrimmedTop (jmin (38, rowH - 30)).withHeight (20).withWidth (24); }
     Rectangle<int> soloBox (int i) const { return muteBox (i).translated (28, 0); }
     Rectangle<int> fxBox (int i)   const { return muteBox (i).translated (56, 0).withWidth (36); }
 
@@ -527,17 +640,34 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 if (b.getRight() < headerW) continue;
                 b.setLeft (jmax ((float) headerW, b.getX()));
                 g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 8.0f);
+                g.setColour (sw::colour::text.withAlpha (0.75f));
+                waves.draw (g, *c, b.reduced (2, 6).withTrimmedTop (10), this);
                 g.setColour (c == selected ? sw::colour::text : sw::colour::line);
                 g.drawRoundedRectangle (b.reduced (0.5f), 8.0f, c == selected ? 1.5f : 1.0f);
                 g.setColour (sw::colour::text); g.setFont (sw::mono (11.0f));
                 g.drawText (c->getName().toUpperCase(), b.reduced (8, 4).toNearestInt(), Justification::topLeft);
+                if (auto mc = dynamic_cast<te::MidiClip*> (c))   // tiny note preview
+                {
+                    auto area = b.reduced (6, 4).withTrimmedTop (14);
+                    auto len = jmax (0.25, mc->getLengthInBeats().inBeats());
+                    g.setColour (sw::colour::text);
+                    for (auto n : mc->getSequence().getNotes())
+                    {
+                        float x = area.getX() + (float) (n->getStartBeat().inBeats() / len) * area.getWidth();
+                        float w = jmax (2.0f, (float) (n->getLengthBeats().inBeats() / len) * area.getWidth());
+                        float y = area.getBottom() - (n->getNoteNumber() - 36) / 60.0f * area.getHeight();
+                        g.fillRect (x, jlimit (area.getY(), area.getBottom() - 2, y), w, 2.0f);
+                    }
+                }
             }
 
             // header card
             auto h = row.withWidth (headerW).reduced (8, 6).toFloat();
             sw::paintCard (g, h, 12.0f);
             g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
-            g.drawText (String (i + 1).paddedLeft ('0', 2) + "  " + t->getName().toUpperCase(),
+            const int rb = Session::returnBus (*t);
+            if (rb >= 0) { g.setColour (sw::colour::accent); g.fillEllipse (h.getRight() - 18, h.getY() + 10, 7, 7); g.setColour (sw::colour::text); }
+            g.drawText ((rb >= 0 ? String ("RET") : String (i + 1).paddedLeft ('0', 2)) + "  " + t->getName().toUpperCase(),
                         h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredLeft);
             auto drawToggle = [&] (Rectangle<int> r, const String& s, bool on, bool red)
             {
@@ -590,6 +720,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
         if (e.y > rulerH && isPositiveAndBelow (r, trs.size()) && e.x < headerW)
         {
             auto* t = trs[r];
+            session.select (t, nullptr);
             if (muteBox (r).contains (e.getPosition())) t->setMute (! t->isMuted (false));
             else if (soloBox (r).contains (e.getPosition())) t->setSolo (! t->isSolo (false));
             else if (fxBox (r).contains (e.getPosition()) || e.mods.isPopupMenu()) trackMenu (*t);
@@ -597,6 +728,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
         }
         int row;
         selected = clipAt (e.getPosition(), row);
+        if (isPositiveAndBelow (row, trs.size())) session.select (trs[row], selected);
         if (selected)
         {
             if (e.mods.isPopupMenu())
@@ -607,26 +739,54 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 return;
             }
             dragStart = selected->getPosition().getStart();
+            dragEnd = selected->getPosition().getEnd();
+            auto b = clipBounds (row, *selected);
+            dragMode = e.x - b.getX() < 7 ? trimLeft : b.getRight() - e.x < 7 ? trimRight : moveClip;
             return;
         }
         if (e.x >= headerW) edit().getTransport().setPosition (timeAt ((float) e.x));
     }
 
+    // Double-click on empty lane: new 1-bar MIDI clip there (for instruments)
+    void mouseDoubleClick (const MouseEvent& e) override
+    {
+        int row; if (clipAt (e.getPosition(), row) || e.x < headerW) return;
+        auto trs = tracks();
+        if (! isPositiveAndBelow (row, trs.size())) return;
+        auto& ts = edit().tempoSequence;
+        auto bar = ts.toBarsAndBeats (timeAt ((float) e.x)).bars;
+        auto start = ts.toTime (te::tempo::BarsAndBeats { .bars = bar });
+        auto end = ts.toTime (te::tempo::BarsAndBeats { .bars = bar + 1 });
+        if (auto mc = te::insertMIDIClip (*trs[row], "MIDI", { start, end }))
+        { selected = mc.get(); session.select (trs[row], mc.get()); session.changed(); }
+    }
+
     void mouseDrag (const MouseEvent& e) override
     {
         if (! selected || e.mods.isPopupMenu()) return;
-        auto t = te::TimePosition::fromSeconds (jmax (0.0, dragStart.inSeconds() + e.getDistanceFromDragStartX() / pxPerSec));
-        if (! e.mods.isAltDown())   // snap to beats unless Alt
+        auto from = dragMode == trimRight ? dragEnd : dragStart;
+        auto t = te::TimePosition::fromSeconds (jmax (0.0, from.inSeconds() + e.getDistanceFromDragStartX() / pxPerSec));
+        if (! e.mods.isAltDown())   // snap to 1/16 unless Alt
         {
             auto& ts = edit().tempoSequence;
-            t = ts.toTime (te::BeatPosition::fromBeats (std::round (ts.toBeats (t).inBeats())));
+            t = ts.toTime (te::BeatPosition::fromBeats (std::round (ts.toBeats (t).inBeats() * 4) / 4));
         }
-        selected->setStart (t, false, true);
+        if (dragMode == trimLeft)       { if (t < dragEnd) selected->setStart (t, true, false); }
+        else if (dragMode == trimRight) { if (t > dragStart) selected->setEnd (t, true); }
+        else                              selected->setStart (t, false, true);
+    }
+
+    void mouseMove (const MouseEvent& e) override
+    {
+        int row; auto c = clipAt (e.getPosition(), row);
+        auto edge = c && (e.x - clipBounds (row, *c).getX() < 7 || clipBounds (row, *c).getRight() - e.x < 7);
+        setMouseCursor (edge ? MouseCursor::LeftRightResizeCursor : MouseCursor::NormalCursor);
     }
 
     void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
     {
-        if (e.mods.isCommandDown()) pxPerSec = jlimit (5.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15));
+        if (e.mods.isAltDown()) { rowH = jlimit (44, 220, rowH + (w.deltaY > 0 ? 10 : -10)); repaint(); return; }
+        if (e.mods.isCommandDown()) pxPerSec = jlimit (4.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15));
         else scrollX = jmax (0.0f, scrollX - (w.deltaX != 0 ? w.deltaX : w.deltaY) * 300.0f);
     }
 
@@ -690,7 +850,10 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
     double pxPerSec = 60.0;
     float scrollX = 0;
     te::Clip* selected = nullptr;
-    te::TimePosition dragStart;
+    te::TimePosition dragStart, dragEnd;
+    enum { moveClip, trimLeft, trimRight } dragMode = moveClip;
+    Waveforms waves;
+    Pill zOut { "-" }, zIn { "+" }, hOut { "H-" }, hIn { "H+" };
     int dropHighlight = -1;
 };
 
@@ -702,8 +865,20 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
 
     struct Strip : Component
     {
-        Strip (Session& s, te::AudioTrack* t) : session (s), track (t)
+        Strip (Session& s, te::AudioTrack* t, bool ret = false) : session (s), track (t), isReturn (ret)
         {
+            if (t && ! ret)
+                for (int bus : { 0, 1 })
+                    if (auto snd = Session::sendOf (*t, bus))
+                    {
+                        auto* k = sends.add (new Slider (Slider::RotaryHorizontalVerticalDrag, Slider::NoTextBox));
+                        k->setRange (-60.0, 6.0, 0.1); k->setSkewFactorFromMidPoint (-12.0);
+                        k->setValue (jmax (-60.0f, snd->getGainDb()), dontSendNotification);
+                        k->setDoubleClickReturnValue (true, -60.0);
+                        k->setTooltip (bus == 0 ? "Send A" : "Send B");
+                        k->onValueChange = [snd, k] { snd->setGainDb (k->getValue() <= -59.9 ? -100.0f : (float) k->getValue()); };
+                        addAndMakeVisible (k);
+                    }
             fader.setSliderStyle (Slider::LinearVertical);
             fader.setTextBoxStyle (Slider::TextBoxBelow, false, 60, 18);
             fader.setRange (-60.0, 6.0, 0.1);
@@ -726,7 +901,7 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 addAndMakeVisible (fx);
                 fx.onClick = [this] { session.choosePluginFor (*track); };
                 stop.onClick = [this] { launch::stopTrack (*track); };
-                addAndMakeVisible (stop);
+                if (! ret) addAndMakeVisible (stop);
                 for (auto p : Session::userPlugins (*t))
                 {
                     auto* b = plugins.add (new Pill ((p->isSynth() ? "* " : "") + p->getName().toUpperCase().substring (0, 14)));
@@ -736,13 +911,34 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 }
             }
         }
-        void paint (Graphics& g) override { sw::paintCard (g, getLocalBounds().toFloat().reduced (3), 14.0f); }
+        void paint (Graphics& g) override
+        {
+            sw::paintCard (g, getLocalBounds().toFloat().reduced (3), 14.0f);
+            if (! sends.isEmpty())
+            {
+                g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
+                for (int i = 0; i < sends.size(); ++i)
+                    g.drawText (i == 0 ? "A" : "B", sends[i]->getBounds().withY (sends[i]->getBottom()).withHeight (10), Justification::centred);
+            }
+            if (isReturn || ! track)
+            {
+                g.setColour (isReturn ? sw::colour::accent : sw::colour::text); g.setFont (sw::display (13.0f));
+                g.drawText (track ? track->getName().toUpperCase() : "MASTER", getLocalBounds().reduced (12, 10).removeFromTop (16), Justification::centred);
+            }
+        }
         void resized() override
         {
             auto r = getLocalBounds().reduced (12);
+            if (isReturn || ! track) r.removeFromTop (22);
             if (track)
             {
-                stop.setBounds (r.removeFromTop (22)); r.removeFromTop (6);
+                if (! isReturn) { stop.setBounds (r.removeFromTop (22)); r.removeFromTop (6); }
+                if (! sends.isEmpty())
+                {
+                    auto row = r.removeFromTop (40); r.removeFromTop (10);
+                    for (auto* k : sends) k->setBounds (row.removeFromLeft (row.getWidth() / 2).reduced (6, 0));
+                    if (sends.size() == 2) sends[1]->setBounds (row.reduced (6, 0));
+                }
                 for (auto* b : plugins) { b->setBounds (r.removeFromTop (20)); r.removeFromTop (3); }
                 fx.setBounds (r.removeFromTop (20)); r.removeFromTop (6);
                 auto row = r.removeFromBottom (22);
@@ -751,7 +947,8 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
             }
             fader.setBounds (r);
         }
-        Session& session; te::AudioTrack* track;
+        Session& session; te::AudioTrack* track; bool isReturn = false;
+        OwnedArray<Slider> sends;
         Slider fader;
         Pill mute { "M" }, solo { "S" }, fx { "+ FX" }, stop { "STOP" };
         OwnedArray<Pill> plugins;
@@ -768,18 +965,20 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
     void rebuild()
     {
         strips.clear();
-        for (auto t : te::getAudioTracks (*session.edit)) addAndMakeVisible (strips.add (new Strip (session, t)));
+        for (auto t : session.regularTracks()) addAndMakeVisible (strips.add (new Strip (session, t)));
+        for (auto t : session.returnTracks())  addAndMakeVisible (strips.add (new Strip (session, t, true)));
         addAndMakeVisible (strips.add (new Strip (session, nullptr)));   // master
         resized(); repaint();
     }
 
-    Array<te::AudioTrack*> tracks() { return te::getAudioTracks (*session.edit); }
+    Array<te::AudioTrack*> tracks() { return session.regularTracks(); }
     int gridTop() const { return sw::space::m; }
     Rectangle<int> slotBounds (int col, int row) const
     {
         return { sw::space::m + col * colW, gridTop() + headerH + row * slotH, colW, slotH };
     }
-    int scenesX() const { return sw::space::m + jmax (1, (int) strips.size() - 1) * colW; }
+    int numRegular() const { int n = 0; for (auto* s : strips) n += (s->track && ! s->isReturn); return jmax (1, n); }
+    int scenesX() const { return sw::space::m + numRegular() * colW; }
     Rectangle<int> sceneBounds (int row) const { return { scenesX() + 6, gridTop() + headerH + row * slotH, sceneW, slotH }; }
 
     void paint (Graphics& g) override
@@ -836,11 +1035,13 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
     void resized() override
     {
         auto top = gridTop() + headerH + (NumScenes + 1) * slotH + sw::space::l;
-        for (int i = 0; i < strips.size(); ++i)
+        // [tracks][scenes][returns][master], returns and master start at the top: they have no clip slots
+        int x = sw::space::m, rx = scenesX() + sceneW + 16;
+        for (auto* s : strips)
         {
-            const bool master = i == strips.size() - 1;
-            int x = master ? scenesX() + 2 : sw::space::m + i * colW;
-            strips[i]->setBounds (x, top, master ? sceneW + 8 : colW, jmax (stripH, getHeight() - top - sw::space::m));
+            const int h = jmax (stripH, getHeight() - top - sw::space::m);
+            if (s->track && ! s->isReturn) { s->setBounds (x, top, colW, h); x += colW; }
+            else { s->setBounds (rx, gridTop(), colW - 10, getHeight() - gridTop() - sw::space::m); rx += colW - 4; }
         }
         stopAll.setBounds (sceneBounds (NumScenes).reduced (2, 3).translated (0, 4));
     }
@@ -860,6 +1061,7 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
         auto cell = cellAt (e.getPosition());
         if (e.x < sw::space::m || ! isPositiveAndBelow (cell.x, trs.size()) || ! isPositiveAndBelow (cell.y, NumScenes)) return;
         auto slot = trs[cell.x]->getClipSlotList().getClipSlots()[cell.y];
+        session.select (trs[cell.x], slot->getClip());
         if (auto c = slot->getClip())
         {
             if (e.mods.isPopupMenu())
@@ -876,6 +1078,20 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 return;
             }
             launch::toggle (*c);
+        }
+    }
+
+    void mouseDoubleClick (const MouseEvent& e) override
+    {
+        auto trs = tracks(); auto cell = cellAt (e.getPosition());
+        if (! isPositiveAndBelow (cell.x, trs.size()) || ! isPositiveAndBelow (cell.y, NumScenes)) return;
+        auto slot = trs[cell.x]->getClipSlotList().getClipSlots()[cell.y];
+        if (slot->getClip()) return;
+        auto& ts = session.edit->tempoSequence;
+        if (auto mc = te::insertMIDIClip (*slot, "MIDI", { te::TimePosition(), ts.toTime (te::tempo::BarsAndBeats { .bars = 1 }) }))
+        {
+            mc->setLoopRangeBeats ({ 0_bp, 4_bd });
+            session.select (trs[cell.x], mc.get()); session.changed();
         }
     }
 
@@ -910,6 +1126,512 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
     OwnedArray<Strip> strips;
     Pill stopAll { "STOP ALL" };
     Point<int> dropCell { -1, -1 };
+};
+
+//==============================================================================
+// Grid values shared by the piano roll and the chopper (in beats)
+static const StringArray gridNames { "1/4", "1/8", "1/16", "1/32", "1/4 T", "1/8 T", "1/16 T", "1/32 T" };
+static double gridBeats (int i) { static const double v[] { 1, 0.5, 0.25, 0.125, 2.0/3, 1.0/3, 1.0/6, 1.0/12 }; return v[jlimit (0, 7, i)]; }
+
+static Label* caption (Component& parent, OwnedArray<Label>& store, const String& text)
+{
+    auto* l = store.add (new Label ({}, text));
+    l->setFont (sw::label (9.0f)); l->setColour (Label::textColourId, sw::colour::text2);
+    parent.addAndMakeVisible (l); return l;
+}
+
+//==============================================================================
+// PIANO ROLL: click to draw, drag to move, drag the right edge to resize, right-click/double-click deletes
+struct PianoRoll : Component
+{
+    PianoRoll (Session& s) : session (s)
+    {
+        grid.addItemList (gridNames, 1); grid.setSelectedId (3, dontSendNotification);
+        length.addItemList ({ "1 BAR", "2 BARS", "4 BARS", "8 BARS" }, 1);
+        length.onChange = [this] { if (clip) { auto bars = std::array { 1, 2, 4, 8 }[(size_t) length.getSelectedItemIndex()];
+                                               setClipBars (bars); } };
+        quantise.onClick = [this] { quantiseAll(); };
+        for (auto* c : { (Component*) &grid, (Component*) &length, (Component*) &quantise, (Component*) &octUp, (Component*) &octDown })
+            addAndMakeVisible (c);
+        octUp.onClick = [this] { transposeAll (12); }; octDown.onClick = [this] { transposeAll (-12); };
+        caption (*this, labels, "GRID"); caption (*this, labels, "LENGTH");
+    }
+
+    void setClip (te::MidiClip* c)
+    {
+        clip = c;
+        if (clip) length.setSelectedItemIndex (jlimit (0, 3, (int) std::log2 (jmax (1.0, clip->getLengthInBeats().inBeats() / 4))), dontSendNotification);
+        repaint();
+    }
+
+    void setClipBars (int bars)
+    {
+        auto& ts = session.edit->tempoSequence;
+        auto beats = te::BeatDuration::fromBeats (bars * 4.0);
+        if (clip->getClipSlot()) clip->setLoopRangeBeats ({ 0_bp, beats });
+        else clip->setEnd (ts.toTime (ts.toBeats (clip->getPosition().getStart()) + beats), true);
+        session.changed(); repaint();
+    }
+
+    double lenBeats() const { return clip ? jmax (1.0, clip->getClipSlot() ? clip->getLoopLengthBeats().inBeats() : clip->getLengthInBeats().inBeats()) : 4.0; }
+    double grd() const { return gridBeats (grid.getSelectedItemIndex()); }
+    te::MidiList& seq() { return clip->getSequence(); }
+    juce::UndoManager* um() { return &session.edit->getUndoManager(); }
+
+    static constexpr int keysW = 46, rowH = 11, toolH = 34;
+    Rectangle<int> rollArea() const { return getLocalBounds().withTrimmedTop (toolH).withTrimmedLeft (keysW); }
+    float xFor (double beat) const { auto r = rollArea(); return r.getX() + (float) (beat / lenBeats()) * r.getWidth(); }
+    double beatAt (float x) const { auto r = rollArea(); return jmax (0.0, (x - r.getX()) / r.getWidth() * lenBeats()); }
+    float yFor (int note) const { return (float) (rollArea().getY() + (topNote - note) * rowH); }
+    int noteAt (float y) const { return topNote - (int) std::floor ((y - rollArea().getY()) / rowH); }
+    double snap (double b) const { return std::floor (b / grd() + 1e-6) * grd(); }
+
+    void paint (Graphics& g) override
+    {
+        auto r = rollArea();
+        g.setColour (sw::colour::card); g.fillRect (getLocalBounds().withTrimmedTop (toolH));
+        if (! clip) { sw::paintCaption (g, "DOUBLE-CLICK AN EMPTY SPOT ON A TRACK TO MAKE A MIDI CLIP", r, Justification::centred); return; }
+        // rows
+        for (int n = topNote; yFor (n) < r.getBottom(); --n)
+        {
+            const bool black = MidiMessage::isMidiNoteBlack (n);
+            auto row = Rectangle<float> ((float) r.getX(), yFor (n), (float) r.getWidth(), (float) rowH);
+            if (black) { g.setColour (sw::colour::subtle); g.fillRect (row); }
+            g.setColour (black ? sw::colour::text : sw::colour::card);
+            g.fillRect (Rectangle<float> (0, yFor (n), keysW - 4.0f, (float) rowH - 1));
+            if (n % 12 == 0)
+            {
+                g.setColour (sw::colour::line); g.drawHorizontalLine ((int) row.getBottom(), (float) r.getX(), (float) r.getRight());
+                g.setColour (sw::colour::text2); g.setFont (sw::mono (9.0f));
+                g.drawText ("C" + String (n / 12 - 1), 2, (int) row.getY(), keysW - 8, rowH, Justification::centredRight);
+            }
+        }
+        g.setColour (sw::colour::line); g.drawVerticalLine (keysW - 2, (float) r.getY(), (float) r.getBottom());
+        // grid lines: bar > beat > grid
+        for (double b = 0; b <= lenBeats() + 1e-6; b += grd())
+        {
+            const bool bar = std::fmod (b + 1e-6, 4.0) < 1e-3, beat = std::fmod (b + 1e-6, 1.0) < 1e-3;
+            g.setColour (bar ? sw::colour::text2 : beat ? sw::colour::line : sw::colour::subtle);
+            g.drawVerticalLine ((int) xFor (b), (float) r.getY(), (float) r.getBottom());
+        }
+        // notes
+        for (auto n : seq().getNotes())
+        {
+            auto nb = Rectangle<float>::leftTopRightBottom (xFor (n->getStartBeat().inBeats()), yFor (n->getNoteNumber()) + 1,
+                                                            xFor (n->getEndBeat().inBeats()) - 1, yFor (n->getNoteNumber()) + rowH - 1);
+            g.setColour (n == dragNote ? sw::colour::accent : sw::colour::text);
+            g.fillRoundedRectangle (nb, 3.0f);
+            g.setColour (sw::colour::card.withAlpha (0.5f));
+            g.fillRect (nb.removeFromLeft (3.0f).reduced (0, 2));   // velocity-ish tick
+        }
+        // playhead inside the clip
+        if (auto lh = clip->getLaunchHandle(); clip->getClipSlot() == nullptr)
+        {
+            auto& tc = session.edit->getTransport(); auto& ts = session.edit->tempoSequence;
+            auto b = ts.toBeats (tc.getPosition()) - ts.toBeats (clip->getPosition().getStart());
+            if (b.inBeats() >= 0 && b.inBeats() <= lenBeats())
+            { g.setColour (sw::colour::accent); g.fillRect (xFor (b.inBeats()), (float) r.getY(), 1.5f, (float) r.getHeight()); }
+        }
+    }
+
+    te::MidiNote* noteUnder (Point<float> p)
+    {
+        for (auto n : seq().getNotes())
+            if (n->getNoteNumber() == noteAt (p.y) && beatAt (p.x) >= n->getStartBeat().inBeats() && beatAt (p.x) < n->getEndBeat().inBeats())
+                return n;
+        return nullptr;
+    }
+
+    void mouseDown (const MouseEvent& e) override
+    {
+        if (! clip || ! rollArea().contains (e.getPosition())) return;
+        dragNote = noteUnder (e.position);
+        if (dragNote && (e.mods.isPopupMenu() || e.getNumberOfClicks() > 1)) { seq().removeNote (*dragNote, um()); dragNote = nullptr; repaint(); return; }
+        if (! dragNote)
+        {
+            auto start = snap (beatAt (e.position.x));
+            dragNote = seq().addNote (noteAt (e.position.y), te::BeatPosition::fromBeats (start), te::BeatDuration::fromBeats (grd()), 100, 0, um());
+            mode = resize;
+            }
+        else mode = xFor (dragNote->getEndBeat().inBeats()) - e.position.x < 6 ? resize : move;
+        startBeat = dragNote->getStartBeat().inBeats(); startLen = dragNote->getLengthBeats().inBeats();
+        startNote = dragNote->getNoteNumber(); downBeat = beatAt (e.position.x);
+        repaint();
+    }
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (! dragNote) return;
+        const double d = beatAt (e.position.x) - downBeat;
+        if (mode == resize)
+            dragNote->setStartAndLength (dragNote->getStartBeat(), te::BeatDuration::fromBeats (jmax (grd(), std::round ((startLen + d) / grd()) * grd())), um());
+        else
+        {
+            auto ns = jlimit (0.0, lenBeats() - grd(), std::round ((startBeat + d) / grd()) * grd());
+            dragNote->setStartAndLength (te::BeatPosition::fromBeats (ns), dragNote->getLengthBeats(), um());
+            dragNote->setNoteNumber (jlimit (0, 127, startNote + (noteAt (e.position.y) - noteAt ((float) e.getMouseDownY()))), um());
+        }
+        repaint();
+    }
+    void mouseUp (const MouseEvent&) override { dragNote = nullptr; session.changed(); repaint(); }
+    void mouseWheelMove (const MouseEvent&, const MouseWheelDetails& w) override
+    { topNote = jlimit (40, 127, topNote + (w.deltaY > 0 ? 2 : -2)); repaint(); }
+
+    void quantiseAll()
+    {
+        if (! clip) return;
+        for (auto n : seq().getNotes())
+            n->setStartAndLength (te::BeatPosition::fromBeats (std::round (n->getStartBeat().inBeats() / grd()) * grd()), n->getLengthBeats(), um());
+        repaint();
+    }
+    void transposeAll (int st)
+    {
+        if (! clip) return;
+        for (auto n : seq().getNotes()) n->setNoteNumber (jlimit (0, 127, n->getNoteNumber() + st), um());
+        repaint();
+    }
+
+    void resized() override
+    {
+        auto t = getLocalBounds().removeFromTop (toolH).reduced (0, 4);
+        labels[0]->setBounds (t.removeFromLeft (40)); grid.setBounds (t.removeFromLeft (90)); t.removeFromLeft (10);
+        labels[1]->setBounds (t.removeFromLeft (56)); length.setBounds (t.removeFromLeft (96)); t.removeFromLeft (10);
+        quantise.setBounds (t.removeFromLeft (92)); t.removeFromLeft (6);
+        octDown.setBounds (t.removeFromLeft (64)); t.removeFromLeft (4); octUp.setBounds (t.removeFromLeft (64));
+    }
+
+    Session& session;
+    te::MidiClip::Ptr clip;
+    ComboBox grid, length;
+    Pill quantise { "QUANTISE" }, octUp { "OCT +" }, octDown { "OCT -" };
+    OwnedArray<Label> labels;
+    int topNote = 84;
+    te::MidiNote* dragNote = nullptr;
+    enum { move, resize } mode = move;
+    double startBeat = 0, startLen = 0, downBeat = 0; int startNote = 60;
+};
+
+//==============================================================================
+// AUDIO CLIP: waveform, pitch (semitones + cents), gain, fades, warp, reverse, loop, chop to grid
+struct AudioClipEditor : Component, ChangeListener
+{
+    AudioClipEditor (Session& s) : session (s), thumb (512, formats, cache)
+    {
+        formats.registerBasicFormats();
+        thumb.addChangeListener (this);
+        auto knob = [this] (Slider& k, double lo, double hi, double step, const String& suffix, const String& name)
+        {
+            k.setSliderStyle (Slider::RotaryHorizontalVerticalDrag);
+            k.setTextBoxStyle (Slider::NoTextBox, false, 0, 0);
+            k.setRange (lo, hi, step); k.setTextValueSuffix (suffix);
+            k.setDoubleClickReturnValue (true, 0.0);
+            auto* v = values.add (new Label());
+            v->setFont (sw::display (15.0f)); v->setJustificationType (Justification::centred);
+            addAndMakeVisible (v);
+            k.onValueChange = [this, &k, v] { v->setText (k.getTextFromValue (k.getValue()), dontSendNotification); apply(); };
+            addAndMakeVisible (k);
+            caption (*this, labels, name)->setJustificationType (Justification::centred);
+        };
+        knob (transpose, -24, 24, 1, " st", "TRANSPOSE");
+        knob (detune, -50, 50, 1, " ct", "DETUNE");
+        knob (gain, -36, 12, 0.1, " dB", "GAIN");
+        knob (fadeIn, 0, 4, 0.01, " s", "FADE IN");
+        knob (fadeOut, 0, 4, 0.01, " s", "FADE OUT");
+        for (auto* b : { &warp, &reverse, &loop }) { b->setClickingTogglesState (true); addAndMakeVisible (b); b->onClick = [this] { apply(); }; }
+        stretch.addItemList ({ "STRETCH: NORMAL", "STRETCH: BETTER" }, 1); stretch.setSelectedId (2, dontSendNotification);
+        stretch.onChange = [this] { apply(); };
+        chopGrid.addItemList ({ "1 BAR", "1/2", "1/4", "1/8", "1/16", "1/8 T", "1/16 T" }, 1); chopGrid.setSelectedId (4, dontSendNotification);
+        chop.onClick = [this] { chopClip(); };
+        speed.addItemList ({ "SPEED 0.25x", "SPEED 0.5x", "SPEED 0.75x", "SPEED 1x", "SPEED 1.5x", "SPEED 2x" }, 1);
+        speed.setSelectedId (4, dontSendNotification);
+        speed.onChange = [this] { applySpeed(); };
+        addAndMakeVisible (speed);
+        for (auto* c : { (Component*) &stretch, (Component*) &chopGrid, (Component*) &chop }) addAndMakeVisible (c);
+        caption (*this, labels, "VOCAL CHOP");
+    }
+
+    void changeListenerCallback (ChangeBroadcaster*) override { repaint(); }
+
+    void setClip (te::AudioClipBase* c)
+    {
+        clip = c; loading = true;
+        if (clip)
+        {
+            auto p = clip->getPitchChange();
+            transpose.setValue (std::round (p), dontSendNotification);
+            detune.setValue (std::round ((p - std::round (p)) * 100), dontSendNotification);
+            gain.setValue (clip->getGainDB(), dontSendNotification);
+            fadeIn.setValue (clip->getFadeIn().inSeconds(), dontSendNotification);
+            fadeOut.setValue (clip->getFadeOut().inSeconds(), dontSendNotification);
+            warp.setToggleState (clip->getAutoTempo(), dontSendNotification);
+            reverse.setToggleState (clip->getIsReversed(), dontSendNotification);
+            loop.setToggleState (clip->isLooping(), dontSendNotification);
+            if (auto w = dynamic_cast<te::WaveAudioClip*> (clip.get())) thumb.setSource (new FileInputSource (w->getOriginalFile()));
+            chop.setEnabled (clip->getClipSlot() == nullptr);
+            static const double r[] { 0.25, 0.5, 0.75, 1.0, 1.5, 2.0 };
+            int best = 3; for (int i = 0; i < 6; ++i) if (std::abs (r[i] - clip->getSpeedRatio()) < 0.01) best = i;
+            speed.setSelectedItemIndex (best, dontSendNotification);
+        }
+        Slider* ks[] { &transpose, &detune, &gain, &fadeIn, &fadeOut };
+        for (int i = 0; i < 5; ++i) values[i]->setText (ks[i]->getTextFromValue (ks[i]->getValue()), dontSendNotification);
+        loading = false; repaint();
+    }
+
+    void apply()
+    {
+        if (! clip || loading) return;
+        const float pitch = (float) (transpose.getValue() + detune.getValue() / 100.0);
+        if (pitch != 0.0f || warp.getToggleState())
+            clip->setTimeStretchMode (stretch.getSelectedId() == 1 ? te::TimeStretcher::soundtouchNormal : te::TimeStretcher::soundtouchBetter);
+        clip->setPitchChange (pitch);
+        clip->setGainDB ((float) gain.getValue());
+        clip->setFadeIn (te::TimeDuration::fromSeconds (fadeIn.getValue()));
+        clip->setFadeOut (te::TimeDuration::fromSeconds (fadeOut.getValue()));
+        clip->setAutoTempo (warp.getToggleState());
+        clip->setIsReversed (reverse.getToggleState());
+        if (loop.getToggleState() != clip->isLooping())
+        {
+            if (loop.getToggleState()) clip->setLoopRangeBeats ({ 0_bp, clip->getLengthInBeats() });
+            else clip->disableLooping();
+        }
+        session.changed();
+    }
+
+    // Slower/faster: turns warp off and plays the file at a different rate (pitch follows, like a turntable)
+    void applySpeed()
+    {
+        if (! clip || loading) return;
+        static const double r[] { 0.25, 0.5, 0.75, 1.0, 1.5, 2.0 };
+        const double ratio = r[jlimit (0, 5, speed.getSelectedItemIndex())];
+        if (ratio != 1.0) { clip->setAutoTempo (false); warp.setToggleState (false, dontSendNotification); }
+        clip->setSpeedRatio (ratio);
+        session.changed();
+    }
+
+    // Splits the clip at every grid line, so each slice can be moved, pitched and reversed on its own.
+    void chopClip()
+    {
+        if (! clip || clip->getClipSlot()) return;
+        auto* track = dynamic_cast<te::ClipTrack*> (clip->getTrack());
+        if (! track) return;
+        static const double beats[] { 4, 2, 1, 0.5, 0.25, 1.0/3, 1.0/6 };
+        const double step = beats[jlimit (0, 6, chopGrid.getSelectedItemIndex())];
+        auto& ts = session.edit->tempoSequence;
+        auto pos = clip->getPosition();
+        auto b0 = ts.toBeats (pos.getStart()).inBeats(), b1 = ts.toBeats (pos.getEnd()).inBeats();
+        te::Clip* rest = clip.get();
+        int slices = 0;
+        for (double b = std::floor (b0 / step) * step + step; b < b1 - 1e-6 && slices < 128; b += step, ++slices)
+            if (auto right = track->splitClip (*rest, ts.toTime (te::BeatPosition::fromBeats (b)))) rest = right;
+        session.select (dynamic_cast<te::AudioTrack*> (track), nullptr);
+        session.changed();
+    }
+
+    void paint (Graphics& g) override
+    {
+        g.setColour (sw::colour::card); g.fillRect (getLocalBounds());
+        auto w = waveArea();
+        g.setColour (sw::colour::subtle); g.fillRoundedRectangle (w.toFloat(), 8.0f);
+        if (! clip) return;
+        g.setColour (sw::colour::text);
+        if (thumb.getTotalLength() > 0)
+        {
+            auto off = clip->getPosition().getOffset().inSeconds();
+            auto len = clip->getPosition().getLength().inSeconds();
+            thumb.drawChannels (g, w.reduced (4), off, off + len, 1.0f);
+        }
+        g.setFont (sw::display (16.0f));
+        g.drawText (clip->getName().toUpperCase(), w.reduced (10, 6), Justification::topLeft);
+    }
+
+    Rectangle<int> waveArea() const { return getLocalBounds().removeFromTop (getHeight() / 2 - 10).reduced (0, 4); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds(); r.removeFromTop (getHeight() / 2 - 10);
+        auto knobs = r.removeFromLeft (jmin (420, r.getWidth() * 3 / 5));
+        Slider* ks[] { &transpose, &detune, &gain, &fadeIn, &fadeOut };
+        const int kw = knobs.getWidth() / 5;
+        for (int i = 0; i < 5; ++i)
+        {
+            auto c = knobs.removeFromLeft (kw);
+            labels[i]->setBounds (c.removeFromTop (16));
+            values[i]->setBounds (c.removeFromBottom (20));
+            ks[i]->setBounds (c.reduced (4, 0));
+        }
+        r.removeFromLeft (12);
+        auto row = [&] { auto x = r.removeFromTop (26); r.removeFromTop (6); return x; };
+        auto a = row(); warp.setBounds (a.removeFromLeft (70)); a.removeFromLeft (4); reverse.setBounds (a.removeFromLeft (84)); a.removeFromLeft (4); loop.setBounds (a.removeFromLeft (64));
+        { auto a2 = row(); stretch.setBounds (a2.removeFromLeft (170)); a2.removeFromLeft (6); speed.setBounds (a2.removeFromLeft (130)); }
+        labels[5]->setBounds (r.removeFromTop (16));
+        auto c = row(); chopGrid.setBounds (c.removeFromLeft (100)); c.removeFromLeft (6); chop.setBounds (c.removeFromLeft (80));
+    }
+
+    Session& session;
+    te::AudioClipBase::Ptr clip;
+    AudioFormatManager formats;
+    AudioThumbnailCache cache { 8 };
+    AudioThumbnail thumb;
+    Slider transpose, detune, gain, fadeIn, fadeOut;
+    Pill warp { "WARP" }, reverse { "REVERSE" }, loop { "LOOP" }, chop { "CHOP" };
+    ComboBox stretch, chopGrid, speed;
+    OwnedArray<Label> labels, values;
+    bool loading = false;
+};
+
+//==============================================================================
+// DEVICES: the selected track's chain. Each card: on/off, open, move, remove, and its first parameters as knobs.
+struct DeviceChain : Component
+{
+    struct Card : Component
+    {
+        Card (Session& s, te::AudioTrack& t, te::Plugin& p) : session (s), track (&t), plugin (&p)
+        {
+            for (auto* b : { &power, &open, &left, &right, &del }) addAndMakeVisible (b);
+            power.setClickingTogglesState (true);
+            power.setToggleState (p.isEnabled(), dontSendNotification);
+            power.onClick = [this] { plugin->setEnabled (power.getToggleState()); repaint(); };
+            open.onClick = [this] { plugin->showWindowExplicitly(); };
+            del.onClick = [this] { auto& sess = session; plugin->deleteFromParent(); sess.changed(); };
+            left.onClick = [this] { move (-1); }; right.onClick = [this] { move (1); };
+            auto params = p.getAutomatableParameters();
+            for (int i = 0; i < jmin (8, params.size()); ++i)
+            {
+                auto param = params[i];
+                auto* k = knobs.add (new Slider (Slider::RotaryHorizontalVerticalDrag, Slider::NoTextBox));
+                k->setRange (0.0, 1.0); k->setValue (param->getCurrentNormalisedValue(), dontSendNotification);
+                k->setTooltip (param->getParameterName());
+                k->onValueChange = [param, k] { param->setNormalisedParameter ((float) k->getValue(), sendNotification); };
+                addAndMakeVisible (k);
+                auto* l = names.add (new Label ({}, param->getParameterName().toUpperCase().substring (0, 10)));
+                l->setFont (sw::label (8.0f)); l->setJustificationType (Justification::centred);
+                l->setColour (Label::textColourId, sw::colour::text2);
+                addAndMakeVisible (l);
+            }
+        }
+        void move (int dir)
+        {
+            auto parent = plugin->state.getParent();
+            const int from = parent.indexOf (plugin->state);
+            int to = from + dir;
+            // keep user plugins before the track's own volume/level plugins
+            if (to < 0 || to >= parent.getNumChildren()) return;
+            for (auto other : track->pluginList)   // never jump past the track's own volume/level plugins
+                if (other->state == parent.getChild (to) && ! Session::isUserPlugin (other)) return;
+            parent.moveChild (from, to, &session.edit->getUndoManager());
+            session.changed();
+        }
+        void paint (Graphics& g) override
+        {
+            auto r = getLocalBounds().toFloat().reduced (3);
+            sw::paintCard (g, r, 14.0f);
+            g.setColour (plugin->isEnabled() ? sw::colour::text : sw::colour::text2);
+            g.setFont (sw::display (15.0f));
+            g.drawText (plugin->getName().toUpperCase(), r.reduced (12, 8).removeFromTop (20).toNearestInt(), Justification::centredLeft);
+            g.setColour (plugin->isSynth() ? sw::colour::accent : sw::colour::text2); g.setFont (sw::label (8.0f));
+            g.drawText (plugin->isSynth() ? "INSTRUMENT" : "EFFECT", r.reduced (12, 8).withTrimmedTop (20).removeFromTop (12).toNearestInt(), Justification::centredLeft);
+        }
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (14, 10);
+            r.removeFromTop (36);
+            auto bar = r.removeFromBottom (22);
+            power.setBounds (bar.removeFromLeft (40)); bar.removeFromLeft (3);
+            open.setBounds (bar.removeFromLeft (50)); bar.removeFromLeft (3);
+            del.setBounds (bar.removeFromRight (26)); bar.removeFromRight (3);
+            right.setBounds (bar.removeFromRight (26)); bar.removeFromRight (3);
+            left.setBounds (bar.removeFromRight (26));
+            r.removeFromBottom (6);
+            const int cols = 4, cw = r.getWidth() / cols, ch = jmin (64, r.getHeight() / 2);
+            for (int i = 0; i < knobs.size(); ++i)
+            {
+                auto cell = Rectangle<int> (r.getX() + (i % cols) * cw, r.getY() + (i / cols) * ch, cw, ch);
+                names[i]->setBounds (cell.removeFromBottom (12));
+                knobs[i]->setBounds (cell.reduced (4, 0));
+            }
+        }
+        Session& session; te::AudioTrack::Ptr track; te::Plugin::Ptr plugin;
+        Pill power { "ON" }, open { "OPEN" }, left { "<" }, right { ">" }, del { "X" };
+        OwnedArray<Slider> knobs; OwnedArray<Label> names;
+    };
+
+    DeviceChain (Session& s) : session (s)
+    {
+        addAndMakeVisible (viewport); viewport.setViewedComponent (&content, false);
+        viewport.setScrollBarsShown (false, true);
+        add.onClick = [this] { if (session.selTrack) session.choosePluginFor (*session.selTrack); };
+        content.addAndMakeVisible (add);
+    }
+    void rebuild()
+    {
+        cards.clear();
+        if (auto t = session.selTrack)
+            for (auto p : Session::userPlugins (*t)) content.addAndMakeVisible (cards.add (new Card (session, *t, *p)));
+        add.setVisible (session.selTrack != nullptr);
+        resized(); repaint();
+    }
+    void paint (Graphics& g) override
+    {
+        g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
+        auto t = session.selTrack;
+        g.drawText ("DEVICES" + (t ? "  ( " + t->getName().toUpperCase() + " )" : String()), 4, 0, getWidth(), 24, Justification::centredLeft);
+        if (! t) sw::paintCaption (g, "SELECT A TRACK", getLocalBounds().withTrimmedTop (24), Justification::centred);
+    }
+    void resized() override
+    {
+        viewport.setBounds (getLocalBounds().withTrimmedTop (28));
+        const int h = viewport.getHeight() - 10, w = 250;
+        int x = 0;
+        for (auto* c : cards) { c->setBounds (x, 0, w, h); x += w + 6; }
+        add.setBounds (x + 6, h / 2 - 16, 90, 32);
+        content.setSize (x + 110, h);
+    }
+    Session& session;
+    Viewport viewport; Component content;
+    OwnedArray<Card> cards;
+    Pill add { "+ ADD" };
+};
+
+//==============================================================================
+// DETAIL PANEL (bottom): clip editor on the left, device chain on the right
+struct DetailPanel : Component, Timer
+{
+    DetailPanel (Session& s) : session (s), roll (s), audio (s), devices (s)
+    {
+        addAndMakeVisible (roll); addChildComponent (audio); addAndMakeVisible (devices);
+        startTimerHz (15);
+    }
+    void refresh()
+    {
+        auto c = Session::alive (session.selClip.get()) ? session.selClip.get() : nullptr;
+        auto mc = dynamic_cast<te::MidiClip*> (c);
+        auto ac = dynamic_cast<te::AudioClipBase*> (c);
+        roll.setVisible (ac == nullptr); audio.setVisible (ac != nullptr);
+        if (mc != roll.clip.get()) roll.setClip (mc);
+        if (ac != audio.clip.get()) audio.setClip (ac);
+        devices.rebuild();
+        repaint();
+    }
+    void timerCallback() override { if (roll.isVisible() && session.edit->getTransport().isPlaying()) roll.repaint(); }
+    void paint (Graphics& g) override
+    {
+        g.setColour (sw::colour::line); g.drawHorizontalLine (0, 0, (float) getWidth());
+        auto r = getLocalBounds().reduced (sw::space::m);
+        sw::paintCard (g, editorArea (r).toFloat().expanded (6), 16.0f);
+        g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
+        auto c = Session::alive (session.selClip.get()) ? session.selClip.get() : nullptr;
+        g.drawText (dynamic_cast<te::AudioClipBase*> (c) ? "AUDIO CLIP" : "MIDI", editorArea (r).removeFromTop (24).translated (0, -2), Justification::centredRight);
+    }
+    Rectangle<int> editorArea (Rectangle<int> r) const { return r.removeFromLeft (r.getWidth() * 3 / 5).reduced (6); }
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (sw::space::m);
+        auto ed = editorArea (r);
+        roll.setBounds (ed); audio.setBounds (ed);
+        r.removeFromLeft (r.getWidth() * 3 / 5);
+        devices.setBounds (r.withTrimmedLeft (sw::space::l));
+    }
+    Session& session;
+    PianoRoll roll; AudioClipEditor audio; DeviceChain devices;
 };
 
 //==============================================================================
@@ -1114,17 +1836,26 @@ struct BpmBox : Component
         g.setColour (sw::colour::text);
         sw::drawNumber (g, String (value, 2), sw::display (18.0f), (float) r.getX(), (float) r.getCentreY());
     }
+    BpmBox()
+    {
+        addChildComponent (editor);
+        editor.setFont (sw::display (18.0f)); editor.setJustification (Justification::centredLeft);
+        editor.setInputRestrictions (6, "0123456789.,");
+        editor.onReturnKey = [this] { set (editor.getText().replaceCharacter (',', '.').getDoubleValue()); editor.setVisible (false); };
+        editor.onEscapeKey = editor.onFocusLost = [this] { editor.setVisible (false); };
+    }
     void mouseDown (const MouseEvent&) override { dragStartValue = value; }
+    void mouseUp (const MouseEvent& e) override
+    {
+        if (e.mouseWasDraggedSinceMouseDown()) return;
+        editor.setText (String (value, 2), false);
+        editor.setBounds (getLocalBounds().reduced (10, 4).withTrimmedRight (30));
+        editor.setVisible (true); editor.grabKeyboardFocus(); editor.selectAll();
+    }
+    TextEditor editor;
     void mouseDrag (const MouseEvent& e) override
     {
         set (dragStartValue - e.getDistanceFromDragStartY() * (e.mods.isShiftDown() ? 0.01 : 0.2));
-    }
-    void mouseDoubleClick (const MouseEvent&) override
-    {
-        auto* w = new AlertWindow ("TEMPO", {}, MessageBoxIconType::NoIcon);
-        w->addTextEditor ("v", String (value, 2)); w->addButton ("OK", 1); w->addButton ("CANCEL", 0);
-        w->enterModalState (true, ModalCallbackFunction::create ([this, w] (int ok)
-            { if (ok) set (w->getTextEditorContents ("v").getDoubleValue()); }), true);
     }
     void set (double v)
     {
@@ -1140,9 +1871,10 @@ struct TopBar : Component, Timer
 {
     TopBar (Session& s) : session (s)
     {
-        for (auto* b : { &browser, &timeline, &grid, &play, &stop, &rec, &loop, &metro, &addTrack, &exportBtn, &settingsBtn })
+        for (auto* b : { &browser, &panel, &timeline, &grid, &play, &stop, &rec, &loop, &metro, &addTrack, &exportBtn, &settingsBtn })
             addAndMakeVisible (b);
-        for (auto* b : { &browser, &loop, &metro }) b->setClickingTogglesState (true);
+        for (auto* b : { &browser, &panel, &loop, &metro }) b->setClickingTogglesState (true);
+        panel.setToggleState (true, dontSendNotification);
         timeline.setRadioGroupId (1); grid.setRadioGroupId (1);
         timeline.setClickingTogglesState (true); grid.setClickingTogglesState (true);
         timeline.setToggleState (true, dontSendNotification);
@@ -1190,7 +1922,8 @@ struct TopBar : Component, Timer
     {
         auto r = getLocalBounds().reduced (10, 10);
         r.removeFromLeft (170);
-        browser.setBounds (r.removeFromLeft (80)); r.removeFromLeft (12);
+        browser.setBounds (r.removeFromLeft (80)); r.removeFromLeft (4);
+        panel.setBounds (r.removeFromLeft (64)); r.removeFromLeft (12);
         timeline.setBounds (r.removeFromLeft (86)); r.removeFromLeft (2);
         grid.setBounds (r.removeFromLeft (60)); r.removeFromLeft (20);
         bpm.setBounds (r.removeFromLeft (130)); r.removeFromLeft (8);
@@ -1204,6 +1937,7 @@ struct TopBar : Component, Timer
     }
 
     Session& session;
+    Pill panel { "PANEL" };
     Pill browser { "BROWSER" }, timeline { "TIMELINE" }, grid { "GRID" }, play { "PLAY" }, stop { "STOP" },
          rec { "REC" }, loop { "LOOP" }, metro { "CLICK" }, addTrack { "+ TRACK" }, exportBtn { "EXPORT" }, settingsBtn { "SETTINGS" };
     BpmBox bpm;
@@ -1218,11 +1952,13 @@ struct MainComponent : Component, DragAndDropContainer
     {
         LookAndFeel::setDefaultLookAndFeel (&laf);
         addAndMakeVisible (top); addAndMakeVisible (browser);
-        addAndMakeVisible (timeline); addChildComponent (grid);
+        addAndMakeVisible (timeline); addChildComponent (grid); addAndMakeVisible (detail);
         top.timeline.onClick = [this] { showGrid (false); };
         top.grid.onClick = [this] { showGrid (true); };
         top.browser.onClick = [this] { browser.setVisible (top.browser.getToggleState()); resized(); };
-        session.onChange = [this] { grid.rebuild(); timeline.repaint(); };
+        top.panel.onClick = [this] { detail.setVisible (top.panel.getToggleState()); resized(); };
+        session.onChange = [this] { grid.rebuild(); timeline.repaint(); detail.refresh(); };
+        session.onSelect = [this] { detail.refresh(); timeline.repaint(); };
         session.onPluginsScanned = [this] { browser.refreshPlugins(); };
         browser.refreshPlugins();
         session.scanPluginsInBackground();
@@ -1249,9 +1985,16 @@ struct MainComponent : Component, DragAndDropContainer
         if (c && k.getKeyCode() == 'T') { session.addTrack(); return true; }
         if (c && k.getKeyCode() == 'S') { session.save(); return true; }
         if (c && k.getKeyCode() == 'L') { top.loop.triggerClick(); return true; }
+        if (c && k.getKeyCode() == 'E' && Session::alive (session.selClip.get()))   // split at the playhead
+        {
+            if (auto ct = dynamic_cast<te::ClipTrack*> (session.selClip->getTrack()))
+                if (auto right = ct->splitClip (*session.selClip, tc.getPosition())) { session.select (session.selTrack.get(), right); session.changed(); }
+            return true;
+        }
         if (c && k.getKeyCode() == 'Z') { session.edit->getUndoManager().undo(); return true; }
         if (c && k.getKeyCode() == 'Y') { session.edit->getUndoManager().redo(); return true; }
         if (c && k.getModifiers().isAltDown() && k.getKeyCode() == 'B') { top.browser.triggerClick(); return true; }
+        if (c && k.getModifiers().isAltDown() && k.getKeyCode() == 'L') { top.panel.triggerClick(); return true; }
         if ((k == KeyPress::deleteKey || k == KeyPress::backspaceKey) && timeline.selected)
         { timeline.selected->removeFromParent(); timeline.selected = nullptr; session.changed(); return true; }
         return false;
@@ -1262,6 +2005,7 @@ struct MainComponent : Component, DragAndDropContainer
         auto r = getLocalBounds();
         top.setBounds (r.removeFromTop (52));
         if (browser.isVisible()) browser.setBounds (r.removeFromLeft (290));
+        if (detail.isVisible()) detail.setBounds (r.removeFromBottom (jmin (330, r.getHeight() / 2)));
         timeline.setBounds (r); grid.setBounds (r);
     }
 
@@ -1272,6 +2016,7 @@ struct MainComponent : Component, DragAndDropContainer
     Browser browser { previewer, session.engine.getPluginManager().knownPluginList };
     Timeline timeline { session };
     ClipGrid grid { session };
+    DetailPanel detail { session };
 };
 
 //==============================================================================
