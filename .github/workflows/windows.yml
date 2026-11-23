@@ -8,6 +8,9 @@ on:
 env:
   SCCACHE_GHA_ENABLED: "true"
 
+permissions:
+  contents: write   # to publish the installer as a direct download
+
 jobs:
   build:
     runs-on: windows-latest
@@ -72,11 +75,6 @@ jobs:
           cp LICENSE README.md dist/
           cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/share/mp3lame/copyright" dist/LAME-LICENSE.txt || true
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SoundWave-windows
-          path: dist
-
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -86,7 +84,12 @@ jobs:
           }
           iscc installer\SoundWave.iss
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SoundWave-Setup
-          path: installer/Output/SoundWave-Setup.exe
+      - name: Publish installer (one file, direct download)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest installer/Output/SoundWave-Setup.exe --prerelease \
+            --title "SoundWave (última versión)" \
+            --notes "Instalador de Windows: descarga SoundWave-Setup.exe y ábrelo. Instala la app, los plugins VST3 y el acceso directo del escritorio."

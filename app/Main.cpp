@@ -207,6 +207,55 @@ struct Session
         changed();   // shows up in DEVICES; OPEN shows its window
     }
 
+    // ---- recording: each track records from one input (audio in or MIDI keyboard) when armed
+    static bool isMidiIn (te::InputDeviceInstance* in) { return in->getInputDevice().getDeviceType() == te::InputDevice::physicalMidiDevice; }
+    static bool isAudioIn (te::InputDeviceInstance* in) { return in->getInputDevice().getDeviceType() == te::InputDevice::waveDevice; }
+    Array<te::InputDeviceInstance*> inputs()
+    {
+        edit->getTransport().ensureContextAllocated();
+        Array<te::InputDeviceInstance*> out;
+        for (auto in : edit->getAllInputDevices()) if (isMidiIn (in) || isAudioIn (in)) out.add (in);
+        return out;
+    }
+    te::InputDeviceInstance* inputOf (te::AudioTrack& t)
+    {
+        for (auto in : inputs()) if (in->getTargets().contains (t.itemID)) return in;
+        return nullptr;
+    }
+    bool isArmed (te::AudioTrack& t) { auto in = inputOf (t); return in && in->isRecordingEnabled (t.itemID); }
+    void setInput (te::AudioTrack& t, te::InputDeviceInstance* in)
+    {
+        const bool armed = isArmed (t);
+        if (auto old = inputOf (t)) [[maybe_unused]] auto r = old->removeTarget (t.itemID, &edit->getUndoManager());
+        if (in)
+        {
+            [[maybe_unused]] auto r = in->setTarget (t.itemID, true, &edit->getUndoManager(), 0);
+            in->getInputDevice().setMonitorMode (isMidiIn (in) ? te::InputDevice::MonitorMode::on : te::InputDevice::MonitorMode::automatic);
+            in->setRecordingEnabled (t.itemID, armed);
+        }
+        changed();
+    }
+    // Arming picks a sensible input if the track has none: MIDI for instrument tracks, the first audio input otherwise.
+    void arm (te::AudioTrack& t, bool on)
+    {
+        auto in = inputOf (t);
+        if (! in && on)
+            for (auto c : inputs())
+                if (isMidiIn (c) == (instrumentOf (t) != nullptr)) { setInput (t, c); in = c; break; }
+        if (in) in->setRecordingEnabled (t.itemID, on);
+        changed();
+    }
+    bool anyArmed() { for (auto t : regularTracks()) if (isArmed (*t)) return true; return false; }
+    // REC: if nothing is armed, arm the selected track first, so pressing REC always records somewhere.
+    void toggleRecord()
+    {
+        auto& tc = edit->getTransport();
+        if (tc.isRecording()) { tc.stop (false, false); changed(); return; }
+        if (! anyArmed())
+            if (auto t = selTrack ? selTrack.get() : regularTracks().getFirst()) arm (*t, true);
+        tc.record (false, false);
+    }
+
     // Every MIDI keyboard plays this track (like arming it), with live monitoring on.
     void routeMidiTo (te::AudioTrack& t)
     {
@@ -313,7 +362,24 @@ struct Session
 
     // ---- return tracks A (reverb) and B (delay), and a send to each from every track
     static int returnBus (te::AudioTrack& t) { return (int) t.state.getProperty ("swReturn", -1); }
-    Array<te::AudioTrack*> regularTracks() { auto a = te::getAudioTracks (*edit); a.removeIf ([] (auto* t) { return returnBus (*t) >= 0; }); return a; }
+    // Display order lives in each track's "swOrder" property (saved with the project); new tracks go last.
+    Array<te::AudioTrack*> regularTracks()
+    {
+        auto a = te::getAudioTracks (*edit);
+        a.removeIf ([] (auto* t) { return returnBus (*t) >= 0; });
+        for (int i = 0; i < a.size(); ++i)
+            if (! a[i]->state.hasProperty ("swOrder")) a[i]->state.setProperty ("swOrder", 1000 + i, nullptr);
+        std::stable_sort (a.begin(), a.end(), [] (auto* x, auto* y) { return (int) x->state["swOrder"] < (int) y->state["swOrder"]; });
+        return a;
+    }
+    void moveTrack (int from, int to)
+    {
+        auto a = regularTracks();
+        if (! isPositiveAndBelow (from, a.size()) || ! isPositiveAndBelow (to, a.size()) || from == to) return;
+        a.move (from, to);
+        for (int i = 0; i < a.size(); ++i) a[i]->state.setProperty ("swOrder", i, &edit->getUndoManager());
+        changed();
+    }
     Array<te::AudioTrack*> returnTracks()  { auto a = te::getAudioTracks (*edit); a.removeIf ([] (auto* t) { return returnBus (*t) < 0; }); return a; }
     Array<te::AudioTrack*> orderedTracks() { auto a = regularTracks(); a.addArray (returnTracks()); return a; }
 
@@ -643,6 +709,8 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).reduced (12, 0).withTrimmedTop (jmin (38, rowH - 30)).withHeight (20).withWidth (24); }
     Rectangle<int> soloBox (int i) const { return muteBox (i).translated (28, 0); }
     Rectangle<int> fxBox (int i)   const { return muteBox (i).translated (56, 0).withWidth (36); }
+    Rectangle<int> armBox (int i)  const { return muteBox (i).translated (96, 0); }
+    Rectangle<int> inBox (int i)   const { return armBox (i).translated (28, 0).withWidth (48); }
 
     Rectangle<float> clipBounds (int row, te::Clip& c) const
     {
@@ -721,10 +789,18 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             drawToggle (muteBox (i), "M", t->isMuted (false), false);
             drawToggle (soloBox (i), "S", t->isSolo (false), true);
             drawToggle (fxBox (i), "FX " + String (Session::userPlugins (*t).size()), false, false);
+            if (rb < 0)
+            {
+                drawToggle (armBox (i), "o", session.isArmed (*t), true);
+                auto in = session.inputOf (*t);
+                g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
+                g.drawText (in ? (Session::isMidiIn (in) ? "MIDI" : "IN " + in->getInputDevice().getName().getLastCharacters (3).trim()) : "NO IN",
+                            inBox (i), Justification::centredLeft);
+            }
             if (auto inst = Session::instrumentOf (*t))
             {
-                g.setColour (sw::colour::accent); g.setFont (sw::label (9.0f));
-                g.drawText (inst->getName().toUpperCase().substring (0, 14), fxBox (i).withX (fxBox (i).getRight() + 6).withWidth (70), Justification::centredLeft);
+                g.setColour (sw::colour::accent); g.setFont (sw::label (8.0f));
+                g.drawText (inst->getName().toUpperCase().substring (0, 12), h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredRight);
             }
         }
 
@@ -736,6 +812,11 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             g.fillRect ((float) px, 0.0f, 1.5f, (float) getHeight());
         }
 
+        if (dropLine >= 0 && dropLine != dragTrack)   // where the dragged track will land
+        {
+            g.setColour (sw::colour::accent);
+            g.fillRect (0.0f, (float) rowBounds (dropLine).getY() + (dropLine > dragTrack ? rowH - 2 : 0), (float) headerW, 2.0f);
+        }
         if (dropHighlight >= 0)
         {
             g.setColour (sw::colour::text.withAlpha (0.06f));
@@ -763,9 +844,13 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         {
             auto* t = trs[r];
             session.select (t, nullptr);
+            const bool ret = Session::returnBus (*t) >= 0;
             if (muteBox (r).contains (e.getPosition())) t->setMute (! t->isMuted (false));
             else if (soloBox (r).contains (e.getPosition())) t->setSolo (! t->isSolo (false));
             else if (fxBox (r).contains (e.getPosition()) || e.mods.isPopupMenu()) trackMenu (*t);
+            else if (! ret && armBox (r).contains (e.getPosition())) session.arm (*t, ! session.isArmed (*t));
+            else if (! ret && inBox (r).contains (e.getPosition())) inputMenu (*t);
+            else if (! ret) dragTrack = r;   // drag the header up/down to reorder
             repaint(); return;
         }
         int row;
@@ -803,8 +888,38 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         { selected = mc.get(); session.select (trs[row], mc.get()); session.changed(); }
     }
 
+    void inputMenu (te::AudioTrack& t)
+    {
+        PopupMenu m;
+        auto ins = session.inputs();
+        auto cur = session.inputOf (t);
+        m.addItem (1, "No input", true, cur == nullptr);
+        for (int i = 0; i < ins.size(); ++i)
+            m.addItem (100 + i, (Session::isMidiIn (ins[i]) ? "MIDI: " : "Audio: ") + ins[i]->getInputDevice().getName(), true, ins[i] == cur);
+        if (ins.isEmpty()) m.addItem (-1, "No inputs: enable them in SETTINGS > AUDIO", false);
+        m.showMenuAsync ({}, [this, ins, tr = te::AudioTrack::Ptr (&t)] (int r)
+        {
+            if (r == 1) session.setInput (*tr, nullptr);
+            else if (r >= 100) session.setInput (*tr, ins[r - 100]);
+            repaint();
+        });
+    }
+
+    void mouseUp (const MouseEvent& e) override
+    {
+        if (dragTrack < 0) return;
+        auto regs = session.regularTracks();
+        const int to = jlimit (0, regs.size() - 1, rowAt (e.y));
+        if (to != dragTrack && isPositiveAndBelow (dragTrack, regs.size()))
+        {
+            session.moveTrack (dragTrack, to);
+        }
+        dragTrack = -1; dropLine = -1; repaint();
+    }
+
     void mouseDrag (const MouseEvent& e) override
     {
+        if (dragTrack >= 0) { dropLine = jlimit (0, session.regularTracks().size() - 1, rowAt (e.y)); repaint(); return; }
         if (! selected || e.mods.isPopupMenu()) return;
         auto from = dragMode == trimRight ? dragEnd : dragStart;
         auto t = te::TimePosition::fromSeconds (jmax (0.0, from.inSeconds() + e.getDistanceFromDragStartX() / pxPerSec));
@@ -894,6 +1009,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     te::Clip* selected = nullptr;
     te::TimePosition dragStart, dragEnd;
     enum { moveClip, trimLeft, trimRight } dragMode = moveClip;
+    int dragTrack = -1, dropLine = -1;
     Waveforms waves;
     Pill zOut { "-" }, zIn { "+" }, hOut { "H-" }, hIn { "H+" };
     int dropHighlight = -1;
@@ -943,7 +1059,14 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 addAndMakeVisible (fx);
                 fx.onClick = [this] { session.choosePluginFor (*track); };
                 stop.onClick = [this] { launch::stopTrack (*track); };
-                if (! ret) addAndMakeVisible (stop);
+                if (! ret)
+                {
+                    addAndMakeVisible (stop); addAndMakeVisible (arm);
+                    arm.setClickingTogglesState (true);
+                    arm.setToggleState (s.isArmed (*t), dontSendNotification);
+                    arm.setColour (TextButton::buttonOnColourId, sw::colour::accent);
+                    arm.onClick = [this] { session.arm (*track, arm.getToggleState()); };
+                }
                 for (auto p : Session::userPlugins (*t))
                 {
                     auto* b = plugins.add (new Pill ((p->isSynth() ? "* " : "") + p->getName().toUpperCase().substring (0, 14)));
@@ -974,7 +1097,11 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
             if (isReturn || ! track) r.removeFromTop (22);
             if (track)
             {
-                if (! isReturn) { stop.setBounds (r.removeFromTop (22)); r.removeFromTop (6); }
+                if (! isReturn)
+                {
+                    auto top = r.removeFromTop (22); r.removeFromTop (6);
+                    arm.setBounds (top.removeFromRight (34)); top.removeFromRight (4); stop.setBounds (top);
+                }
                 if (! sends.isEmpty())
                 {
                     auto row = r.removeFromTop (40); r.removeFromTop (10);
@@ -992,7 +1119,7 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
         Session& session; te::AudioTrack* track; bool isReturn = false;
         OwnedArray<Slider> sends;
         Slider fader;
-        Pill mute { "M" }, solo { "S" }, fx { "+ FX" }, stop { "STOP" };
+        Pill mute { "M" }, solo { "S" }, fx { "+ FX" }, stop { "STOP" }, arm { "o" };
         OwnedArray<Pill> plugins;
     };
 
@@ -1928,7 +2055,7 @@ struct TopBar : Component, Timer
         auto& tc = session.edit->getTransport();
         play.onClick = [&tc] { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); };
         stop.onClick = [&tc] { tc.stop (false, false); tc.setPosition (te::TimePosition()); };
-        rec.onClick  = [&tc] { tc.isRecording() ? tc.stop (false, false) : tc.record (false); };
+        rec.onClick  = [this] { session.toggleRecord(); };
         loop.onClick = [this, &tc] { tc.looping = loop.getToggleState(); };
         metro.onClick = [this] { session.edit->clickTrackEnabled = metro.getToggleState(); };
         addTrack.onClick = [this] { session.addTrack(); };
