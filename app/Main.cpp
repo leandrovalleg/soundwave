@@ -173,15 +173,72 @@ struct Session
         m.showMenuAsync ({}, [this, types, tr = te::AudioTrack::Ptr (&t)] (int r)
         {
             const int idx = KnownPluginList::getIndexChosenByMenu (types, r);
-            if (idx < 0) return;
-            if (auto p = edit->getPluginCache().createNewPlugin (te::ExternalPlugin::xmlTypeName, types[idx]))
-            {
-                tr->pluginList.insertPlugin (p, jmax (0, tr->pluginList.indexOf (tr->getVolumePlugin())), nullptr);
-                p->showWindowExplicitly();
-                changed();
-            }
+            if (idx >= 0) insertPlugin (*tr, types[idx]);
         });
     }
+
+    // Instruments go first in the chain and get the MIDI keyboard; effects go before the volume.
+    void insertPlugin (te::AudioTrack& t, const PluginDescription& d)
+    {
+        auto p = edit->getPluginCache().createNewPlugin (te::ExternalPlugin::xmlTypeName, d);
+        if (! p) return;
+        if (d.isInstrument)
+        {
+            for (auto old : userPlugins (t)) if (old->isSynth()) old->deleteFromParent();   // one instrument per track
+            t.pluginList.insertPlugin (p, 0, nullptr);
+            routeMidiTo (t);
+        }
+        else
+            t.pluginList.insertPlugin (p, jmax (0, t.pluginList.indexOf (t.getVolumePlugin())), nullptr);
+        p->showWindowExplicitly();
+        changed();
+    }
+
+    // Every MIDI keyboard plays this track (like arming it), with live monitoring on.
+    void routeMidiTo (te::AudioTrack& t)
+    {
+        edit->getTransport().ensureContextAllocated();
+        for (auto in : edit->getAllInputDevices())
+            if (in->getInputDevice().getDeviceType() == te::InputDevice::physicalMidiDevice)
+            {
+                [[maybe_unused]] auto r = in->setTarget (t.itemID, true, &edit->getUndoManager(), 0);
+                in->getInputDevice().setMonitorMode (te::InputDevice::MonitorMode::on);
+            }
+    }
+
+    static te::Plugin* instrumentOf (te::AudioTrack& t)
+    {
+        for (auto p : userPlugins (t)) if (p->isSynth()) return p;
+        return nullptr;
+    }
+
+    // Finds plugins without a trip to SETTINGS: the VST3 folder next to the exe + the system VST3 folders.
+    // Runs in the background on every start; already-known files are skipped quickly.
+    std::function<void()> onPluginsScanned;
+    void scanPluginsInBackground()
+    {
+        auto& pm = engine.getPluginManager();
+        AudioPluginFormat* vst3 = nullptr;
+        for (auto* f : pm.pluginFormatManager.getFormats()) if (f->getName() == "VST3") vst3 = f;
+        if (! vst3) return;
+        FileSearchPath paths = vst3->getDefaultLocationsToSearch();
+        auto exeDir = File::getSpecialLocation (File::currentExecutableFile).getParentDirectory();
+        for (auto d : { exeDir.getChildFile ("VST3"), exeDir.getParentDirectory().getChildFile ("VST3") })
+            if (d.isDirectory()) paths.addIfNotAlreadyThere (d);
+        paths.addPath (FileSearchPath (settings().getValue ("lastPluginSearchPathVST3")));
+        auto deadMans = settings().getFile().getSiblingFile ("plugin-scan-crashes.txt");
+        scanThread = std::make_unique<std::thread> ([this, vst3, paths, deadMans]
+        {
+            auto& list = engine.getPluginManager().knownPluginList;
+            PluginDirectoryScanner scanner (list, *vst3, paths, true, deadMans, false);
+            String name;
+            while (! stopScan && scanner.scanNextFile (true, name)) {}
+            MessageManager::callAsync ([this] { if (onPluginsScanned) onPluginsScanned(); });
+        });
+    }
+    ~Session() { stopScan = true; if (scanThread) scanThread->join(); }
+    std::atomic<bool> stopScan { false };
+    std::unique_ptr<std::thread> scanThread;
 
     static Array<te::Plugin*> userPlugins (te::AudioTrack& t)
     {
@@ -242,10 +299,20 @@ struct Pill : TextButton
 
 //==============================================================================
 // BROWSER: your library folders, sample preview, drag onto TIMELINE or GRID
-struct Browser : Component, FileBrowserListener, DragAndDropContainer
+struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxModel, ChangeListener
 {
-    Browser (Previewer& pv) : preview (pv)
+    Browser (Previewer& pv, KnownPluginList& kl) : preview (pv), known (kl)
     {
+        for (auto* b : { &tabSamples, &tabInst, &tabFx })
+        {
+            b->setRadioGroupId (7); b->setClickingTogglesState (true); addAndMakeVisible (b);
+            b->onClick = [this] { refreshPlugins(); resized(); repaint(); };
+        }
+        tabSamples.setToggleState (true, dontSendNotification);
+        plugins.setModel (this); plugins.setRowHeight (24);
+        plugins.setColour (ListBox::backgroundColourId, sw::colour::card);
+        addChildComponent (plugins);
+        known.addChangeListener (this);
         for (auto* b : { &add, &remove, &previewToggle }) addAndMakeVisible (b);
         addAndMakeVisible (folders);
         folders.onChange = [this] { showFolder (folders.getText()); };
@@ -261,7 +328,39 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer
         addAndMakeVisible (tree);
         reloadFolders();
     }
-    ~Browser() override { tree.removeListener (this); }
+    ~Browser() override { tree.removeListener (this); known.removeChangeListener (this); }
+
+    // ---- plugin tabs
+    bool samplesTab() const { return tabSamples.getToggleState(); }
+    void changeListenerCallback (ChangeBroadcaster*) override { MessageManager::callAsync ([sp = SafePointer (this)] { if (sp) sp->refreshPlugins(); }); }
+    void refreshPlugins()
+    {
+        shown.clear();
+        const bool inst = tabInst.getToggleState();
+        for (auto& d : known.getTypes()) if (d.isInstrument == inst) shown.add (d);
+        std::sort (shown.begin(), shown.end(), [] (auto& a, auto& b)
+            { bool sa = a.manufacturerName == "SoundWave", sb = b.manufacturerName == "SoundWave";
+              return sa != sb ? sa : a.name.compareIgnoreCase (b.name) < 0; });
+        plugins.updateContent(); plugins.repaint();
+        const bool s = samplesTab();
+        for (auto* c : { (Component*) &tree, (Component*) &folders, (Component*) &add, (Component*) &remove, (Component*) &previewToggle }) c->setVisible (s);
+        plugins.setVisible (! s);
+    }
+    int getNumRows() override { return shown.size(); }
+    void paintListBoxItem (int row, Graphics& g, int w, int h, bool selected) override
+    {
+        if (! isPositiveAndBelow (row, shown.size())) return;
+        auto& d = shown.getReference (row);
+        if (selected) { g.setColour (sw::colour::text); g.fillRoundedRectangle (0, 1, (float) w, (float) h - 2, 6.0f); }
+        g.setColour (selected ? sw::colour::card : sw::colour::text); g.setFont (sw::mono (12.0f));
+        g.drawText (d.name, 8, 0, w - 100, h, Justification::centredLeft);
+        g.setColour (selected ? sw::colour::card : sw::colour::text2); g.setFont (sw::label (9.0f));
+        g.drawText (d.manufacturerName.toUpperCase().substring (0, 12), w - 96, 0, 90, h, Justification::centredRight);
+    }
+    var getDragSourceDescription (const SparseSet<int>& rows) override
+    {
+        return rows.isEmpty() ? var() : var ("swplugin:" + shown[rows[0]].createIdentifierString());
+    }
 
     StringArray savedFolders() const
     {
@@ -316,7 +415,13 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer
         sw::paintCard (g, r);
         g.setColour (sw::colour::text); g.setFont (sw::display (20.0f));
         g.drawText ("LIBRARY", r.reduced (16, 12).removeFromTop (24), Justification::centredLeft);
-        sw::paintCaption (g, "PLACES", getLocalBounds().reduced (28).withTrimmedTop (34).removeFromTop (14));
+        if (! samplesTab())
+        {
+            if (shown.isEmpty()) sw::paintCaption (g, "SCANNING PLUGINS...", plugins.getBounds().withHeight (30), Justification::centred);
+            else sw::paintCaption (g, "DRAG ONTO A TRACK", plugins.getBounds().withY (plugins.getBottom() + 4).withHeight (16), Justification::centredLeft);
+            return;
+        }
+        sw::paintCaption (g, "PLACES", getLocalBounds().reduced (28).withTrimmedTop (64).removeFromTop (14));
         if (savedFolders().isEmpty())
             sw::paintCaption (g, "ADD A FOLDER WITH YOUR SAMPLES", tree.getBounds().withHeight (30), Justification::centred);
     }
@@ -324,7 +429,14 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer
     void resized() override
     {
         auto r = getLocalBounds().reduced (sw::space::m).reduced (16, 12);
-        r.removeFromTop (24 + 30);
+        r.removeFromTop (30);
+        auto tabs = r.removeFromTop (24);
+        tabSamples.setBounds (tabs.removeFromLeft (76)); tabs.removeFromLeft (3);
+        tabInst.setBounds (tabs.removeFromLeft (100)); tabs.removeFromLeft (3);
+        tabFx.setBounds (tabs);
+        r.removeFromTop (8);
+        plugins.setBounds (r.withTrimmedBottom (24));
+        r.removeFromTop (22);
         auto row = r.removeFromTop (28);
         remove.setBounds (row.removeFromRight (28)); row.removeFromRight (4);
         add.setBounds (row.removeFromRight (28)); row.removeFromRight (6);
@@ -336,6 +448,10 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer
     }
 
     Previewer& preview;
+    KnownPluginList& known;
+    Array<PluginDescription> shown;
+    ListBox plugins;
+    Pill tabSamples { "SAMPLES" }, tabInst { "INSTRUMENTS" }, tabFx { "EFFECTS" };
     ComboBox folders;
     Pill add { "+" }, remove { "-" }, previewToggle { "PREVIEW" };
     TimeSliceThread thread { "SW file scan" };
@@ -344,6 +460,15 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer
     FileTreeComponent tree { list };
     std::unique_ptr<FileChooser> chooser;
 };
+
+// A plugin dragged from the browser: "swplugin:<identifier>". Returns true if it was one.
+static bool dropPlugin (Session& s, const String& desc, std::function<te::AudioTrack*()> targetTrack)
+{
+    if (! desc.startsWith ("swplugin:")) return false;
+    if (auto d = s.engine.getPluginManager().knownPluginList.getTypeForIdentifierString (desc.fromFirstOccurrenceOf (":", false, false)))
+        if (auto* t = targetTrack()) s.insertPlugin (*t, *d);
+    return true;
+}
 
 //==============================================================================
 // TIMELINE: horizontal arrangement
@@ -424,6 +549,11 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
             drawToggle (muteBox (i), "M", t->isMuted (false), false);
             drawToggle (soloBox (i), "S", t->isSolo (false), true);
             drawToggle (fxBox (i), "FX " + String (Session::userPlugins (*t).size()), false, false);
+            if (auto inst = Session::instrumentOf (*t))
+            {
+                g.setColour (sw::colour::accent); g.setFont (sw::label (9.0f));
+                g.drawText (inst->getName().toUpperCase().substring (0, 14), fxBox (i).withX (fxBox (i).getRight() + 6).withWidth (70), Justification::centredLeft);
+            }
         }
 
         // playhead
@@ -527,13 +657,20 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
     }
 
     // drops: from the browser, or from Explorer/Finder
-    bool isInterestedInDragSource (const SourceDetails& d) override { return d.description == "swfile"; }
+    bool isInterestedInDragSource (const SourceDetails& d) override
+    { return d.description == "swfile" || d.description.toString().startsWith ("swplugin:"); }
     bool isInterestedInFileDrag (const StringArray& files) override { return isAudioFile (File (files[0])); }
     void itemDragMove (const SourceDetails& d) override { dropHighlight = rowAt (d.localPosition.y); repaint(); }
     void fileDragMove (const StringArray&, int, int y) override { dropHighlight = rowAt (y); repaint(); }
     void itemDragExit (const SourceDetails&) override { dropHighlight = -1; repaint(); }
     void fileDragExit (const StringArray&) override { dropHighlight = -1; repaint(); }
-    void itemDropped (const SourceDetails& d) override { drop (draggedFile, d.localPosition); }
+    void itemDropped (const SourceDetails& d) override
+    {
+        if (dropPlugin (session, d.description.toString(), [&] { auto trs = tracks(); int r = rowAt (d.localPosition.y);
+                                                                 return isPositiveAndBelow (r, trs.size()) ? trs[r] : session.addTrack(); }))
+        { dropHighlight = -1; repaint(); return; }
+        drop (draggedFile, d.localPosition);
+    }
     void filesDropped (const StringArray& f, int x, int y) override { drop (File (f[0]), { x, y }); }
 
     void drop (const File& f, Point<int> p)
@@ -592,7 +729,8 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
                 addAndMakeVisible (stop);
                 for (auto p : Session::userPlugins (*t))
                 {
-                    auto* b = plugins.add (new Pill (p->getName().toUpperCase().substring (0, 14)));
+                    auto* b = plugins.add (new Pill ((p->isSynth() ? "* " : "") + p->getName().toUpperCase().substring (0, 14)));
+                    if (p->isSynth()) b->setColour (TextButton::textColourOffId, sw::colour::accent);
                     b->onClick = [p] { p->showWindowExplicitly(); };
                     addAndMakeVisible (b);
                 }
@@ -741,13 +879,20 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
         }
     }
 
-    bool isInterestedInDragSource (const SourceDetails& d) override { return d.description == "swfile"; }
+    bool isInterestedInDragSource (const SourceDetails& d) override
+    { return d.description == "swfile" || d.description.toString().startsWith ("swplugin:"); }
     bool isInterestedInFileDrag (const StringArray& files) override { return isAudioFile (File (files[0])); }
     void itemDragMove (const SourceDetails& d) override { dropCell = cellAt (d.localPosition); repaint(); }
     void fileDragMove (const StringArray&, int x, int y) override { dropCell = cellAt ({ x, y }); repaint(); }
     void itemDragExit (const SourceDetails&) override { dropCell = { -1, -1 }; repaint(); }
     void fileDragExit (const StringArray&) override { dropCell = { -1, -1 }; repaint(); }
-    void itemDropped (const SourceDetails& d) override { drop (draggedFile, d.localPosition); }
+    void itemDropped (const SourceDetails& d) override
+    {
+        if (dropPlugin (session, d.description.toString(), [&] { auto trs = tracks(); int c = cellAt (d.localPosition).x;
+                                                                 return isPositiveAndBelow (c, trs.size()) ? trs[c] : session.addTrack(); }))
+        { dropCell = { -1, -1 }; return; }
+        drop (draggedFile, d.localPosition);
+    }
     void filesDropped (const StringArray& f, int x, int y) override { drop (File (f[0]), { x, y }); }
 
     void drop (const File& f, Point<int> p)
@@ -1078,6 +1223,9 @@ struct MainComponent : Component, DragAndDropContainer
         top.grid.onClick = [this] { showGrid (true); };
         top.browser.onClick = [this] { browser.setVisible (top.browser.getToggleState()); resized(); };
         session.onChange = [this] { grid.rebuild(); timeline.repaint(); };
+        session.onPluginsScanned = [this] { browser.refreshPlugins(); };
+        browser.refreshPlugins();
+        session.scanPluginsInBackground();
         setWantsKeyboardFocus (true);
         setSize (1440, 860);
     }
@@ -1121,7 +1269,7 @@ struct MainComponent : Component, DragAndDropContainer
     Session session;
     Previewer previewer { session.engine.getDeviceManager().deviceManager };
     TopBar top { session };
-    Browser browser { previewer };
+    Browser browser { previewer, session.engine.getPluginManager().knownPluginList };
     Timeline timeline { session };
     ClipGrid grid { session };
 };
