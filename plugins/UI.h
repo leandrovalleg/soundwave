@@ -322,7 +322,7 @@ struct Panel : juce::Component
                     if (same > 1) key = firstWord(rp->getName(64));
                 }
                 auto it = std::find_if(groups.begin(), groups.end(), [&](auto& g) { return g.key == key; });
-                if (it == groups.end()) { groups.push_back({ key }); it = groups.end() - 1; }
+                if (it == groups.end()) { groups.emplace_back(); groups.back().key = key; it = groups.end() - 1; }
                 it->params.push_back(rp);
                 ++count;
             }
@@ -420,7 +420,10 @@ struct Panel : juce::Component
         {
             size_t j = i; int used = 0;
             while (j < groups.size() && (j == i || used + gap + groups[j].bounds.getWidth() <= avail))
-                used += (j == i ? 0 : gap) + groups[j++].bounds.getWidth();
+            {
+                used += (j == i ? 0 : gap) + groups[j].bounds.getWidth();
+                ++j;
+            }
             int extra = avail - used, rowH = 0, x = margin, natural = used - gap * (int) (j - i - 1);
             for (size_t k = i; k < j; ++k) rowH = juce::jmax(rowH, groups[k].bounds.getHeight());
             for (size_t k = i; k < j; ++k)
