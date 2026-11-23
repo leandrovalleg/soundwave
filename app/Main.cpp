@@ -260,6 +260,11 @@ struct Session
     bool isArmed (te::AudioTrack& t) { auto in = inputOf (t); return in && in->isRecordingEnabled (t.itemID); }
     void setInput (te::AudioTrack& t, te::InputDeviceInstance* in)
     {
+        auto& dm = engine.getDeviceManager().deviceManager;
+        auto setup = dm.getAudioDeviceSetup();
+        Logger::writeToLog ("input for " + t.getName() + ": " + (in ? in->getInputDevice().getName() : String ("none"))
+                            + " | card in=" + setup.inputDeviceName + " out=" + setup.outputDeviceName
+                            + " channels=" + setup.inputChannels.toString (2) + " type=" + dm.getCurrentAudioDeviceType());
         const bool armed = isArmed (t);
         if (auto old = inputOf (t)) [[maybe_unused]] auto r = old->removeTarget (t.itemID, &edit->getUndoManager());
         if (in)
@@ -789,7 +794,9 @@ struct IORow : Component, Timer
         {
             auto ins = session.inputs();
             const int i = input.getSelectedItemIndex() - 1;
-            session.setInput (*track, isPositiveAndBelow (i, ins.size()) ? ins[i] : nullptr);
+            auto* in = isPositiveAndBelow (i, ins.size()) ? ins[i] : nullptr;
+            // setInput() rebuilds this row, so run it after the ComboBox has finished with the click
+            MessageManager::callAsync ([&s = session, t = track, in] { s.setInput (*t, in); });
         };
         arm.setClickingTogglesState (true);
         arm.setColour (TextButton::buttonOnColourId, sw::colour::accent);
@@ -2499,13 +2506,13 @@ struct AppLook : sw::LookAndFeel
         return img;
     }
     static Image folderIcon (Colour c) { return dots ({ "1111.....", "1..111111", "1.......1", "1.......1", "1.......1", "1.......1", "111111111" }, c, 15); }
-    static Image fileIcon (Colour c)   { return dots ({ "11111..", "1...11.", "1....11", "1..1..1", "1.111.1", "1..1..1", "1111111" }, c, 15); }
+    static Image fileIcon (Colour c)   { return dots ({ ".......", "...1...", ".1.1...", ".1.1.1.", "11111.1", ".1.1.1.", ".1.1..." }, c, 15); }
 
     void drawFileBrowserRow (Graphics& g, int w, int h, const File&, const String& name, Image*, const String&, const String&,
                              bool isDir, bool selected, int, DirectoryContentsDisplayComponent&) override
     {
         if (selected) { g.setColour (sw::colour::text); g.fillRoundedRectangle (0, 1, (float) w, (float) h - 2, 6.0f); }
-        auto icon = isDir ? folderIcon (selected ? sw::colour::card : sw::colour::accent) : fileIcon (selected ? sw::colour::card : sw::colour::text);
+        auto icon = isDir ? folderIcon (selected ? sw::colour::card : sw::colour::accent) : fileIcon (selected ? sw::colour::card : sw::colour::text2);
         const float iw = icon.getWidth() / 2.0f, ih = icon.getHeight() / 2.0f;
         g.drawImage (icon, Rectangle<float> (4, (h - ih) / 2, iw, ih));
         g.setColour (selected ? sw::colour::card : sw::colour::text);
