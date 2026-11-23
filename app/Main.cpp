@@ -3310,9 +3310,10 @@ static const char* swVersionName = "BETA 0.8";
 // Guided tour: dims the window, cuts a hole around the real control and explains it. First launch + AYUDA > Tour.
 struct Tour : Component, Timer
 {
-    struct Step { String title, body; std::function<Rectangle<int>()> target; std::function<void()> before; };
+    struct Step { String title, body; std::function<Rectangle<int>()> target; std::function<void()> before; DotButton::Glyph glyph = DotButton::none; };
     std::vector<Step> steps;
-    int index = 0; float phase = 0;
+    int index = 0; float phase = 0, cardIn = 0;
+    Rectangle<float> shown;   // the hole glides from one control to the next
     Pill back { "ATRAS" }, next { "SIGUIENTE" }, skip { "SALTAR" };
     std::function<void()> onDone;
 
@@ -3335,12 +3336,14 @@ struct Tour : Component, Timer
         if (steps[(size_t) index].before) steps[(size_t) index].before();
         back.setVisible (index > 0);
         next.setButtonText (index + 1 == (int) steps.size() ? "EMPEZAR" : "SIGUIENTE");
+        cardIn = 0;
+        if (shown.isEmpty()) shown = hole().toFloat();
         resized(); repaint();
     }
     Rectangle<int> hole() const { auto& st = steps[(size_t) index]; return st.target ? st.target().expanded (6) : Rectangle<int>(); }
     Rectangle<int> card() const
     {
-        const int w = 380, h = 190;
+        const int w = 440, h = 200;
         auto hl = hole();
         if (hl.isEmpty()) return getLocalBounds().withSizeKeepingCentre (w + 60, h + 40);
         Rectangle<int> c;
@@ -3349,23 +3352,54 @@ struct Tour : Component, Timer
         else                                       c = { hl.getRight() + 16, hl.getY(), w, h };
         return c.constrainedWithin (getLocalBounds().reduced (16));
     }
-    void timerCallback() override { phase += 0.05f; repaint(); }
+    void timerCallback() override
+    {
+        phase += 0.05f;
+        cardIn = jmin (1.0f, cardIn + 0.06f);
+        auto target = hole().toFloat();
+        if (target.isEmpty()) target = getLocalBounds().toFloat().withSizeKeepingCentre (0, 0);
+        auto lerp = [] (float a, float b) { return a + (b - a) * 0.22f; };
+        shown = { lerp (shown.getX(), target.getX()), lerp (shown.getY(), target.getY()), lerp (shown.getWidth(), target.getWidth()), lerp (shown.getHeight(), target.getHeight()) };
+        repaint();
+    }
     void paint (Graphics& g) override
     {
-        auto hl = hole();
+        auto hl = shown;
         Path dim; dim.addRectangle (getLocalBounds().toFloat());
-        if (! hl.isEmpty()) { dim.addRoundedRectangle (hl.toFloat(), 14.0f); dim.setUsingNonZeroWinding (false); }
-        g.setColour (Colours::black.withAlpha (0.55f)); g.fillPath (dim);
-        if (! hl.isEmpty())   // pulsing red ring around the control
+        if (hl.getWidth() > 4) { dim.addRoundedRectangle (hl, 14.0f); dim.setUsingNonZeroWinding (false); }
+        g.setColour (Colour (0xff0d0d0d).withAlpha (0.72f)); g.fillPath (dim);
+        g.setColour (Colours::white.withAlpha (0.05f));   // faint dot grid on the dark layer
+        for (int y = 8; y < getHeight(); y += 16) for (int x = 8; x < getWidth(); x += 16)
+            if (! hl.contains ((float) x, (float) y)) g.fillRect (x, y, 2, 2);
+        if (hl.getWidth() > 4)   // pulsing red ring, plus red dots marching around it
         {
             const float p = 0.5f + 0.5f * std::sin (phase * 3.0f);
-            g.setColour (sw::colour::accent.withAlpha (0.35f + 0.5f * p));
-            g.drawRoundedRectangle (hl.toFloat().expanded (2 + 4 * p), 16.0f, 2.0f);
+            g.setColour (sw::colour::accent.withAlpha (0.45f + 0.5f * p));
+            g.drawRoundedRectangle (hl.expanded (3 + 4 * p), 17.0f, 2.0f);
+            Path ring; ring.addRoundedRectangle (hl.expanded (12), 20.0f);
+            const float len = ring.getLength();
+            for (int i = 0; i < 4; ++i)
+            {
+                auto pt = ring.getPointAlongPath (std::fmod (phase * 90.0f + i * len / 4, len));
+                g.setColour (sw::colour::accent); g.fillRoundedRectangle (pt.x - 3, pt.y - 3, 6, 6, 1.8f);
+            }
         }
-        auto c = card().toFloat();
-        g.setColour (Colours::black.withAlpha (0.18f)); g.fillRoundedRectangle (c.translated (0, 6), 20.0f);
-        g.setColour (sw::colour::card); g.fillRoundedRectangle (c, 20.0f);
+        const float ease = 1.0f - std::pow (1.0f - cardIn, 3.0f);
+        g.beginTransparencyLayer (ease);
+        auto c = card().toFloat().translated (0, (1.0f - ease) * 14.0f);
+        g.setColour (Colours::black.withAlpha (0.25f)); g.fillRoundedRectangle (c.translated (0, 8), 22.0f);
+        g.setColour (sw::colour::card); g.fillRoundedRectangle (c, 22.0f);
         auto r = c.reduced (22, 18);
+        {   // big red dot icon of the step, drawn in dot by dot
+            auto icon = r.withTrimmedTop (30).removeFromLeft (64);
+            const char* bits = steps[(size_t) index].glyph != DotButton::none ? DotButton::rows (steps[(size_t) index].glyph)
+                                 : "1.....1" "1.....1" "1..1..1" "1.1.1.1" "11...11" "1.....1" ".......";
+            const int shownDots = (int) (ease * 60.0f);
+            for (int i = 0, k = 0; i < 49 && bits[i]; ++i)
+                if (bits[i] != '.' && k++ < shownDots)
+                    { g.setColour (sw::colour::accent); g.fillRoundedRectangle (icon.getX() + (i % 7) * 8.0f, icon.getY() + 8 + (i / 7) * 8.0f, 6.0f, 6.0f, 1.8f); }
+            r.removeFromLeft (0);
+        }
         auto top = r.removeFromTop (14);
         for (int i = 0; i < (int) steps.size(); ++i)   // progress: one dot per step
         {
@@ -3375,12 +3409,14 @@ struct Tour : Component, Timer
         g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
         g.drawText (String (index + 1).paddedLeft ('0', 2) + " / " + String ((int) steps.size()).paddedLeft ('0', 2), top, Justification::centredRight);
         r.removeFromTop (10);
+        r.removeFromLeft (78);
         auto& st = steps[(size_t) index];
         g.setColour (sw::colour::text); g.setFont (sw::display (22.0f));
         g.drawText (st.title, r.removeFromTop (30), Justification::centredLeft);
         r.removeFromTop (6);
         g.setColour (sw::colour::text2); g.setFont (sw::mono (13.5f));
-        g.drawFittedText (st.body, r.removeFromTop (78).toNearestInt(), Justification::topLeft, 5, 1.0f);
+        g.drawFittedText (st.body, r.removeFromTop (84).toNearestInt(), Justification::topLeft, 5, 1.0f);
+        g.endTransparencyLayer();
     }
     void resized() override
     {
@@ -3407,7 +3443,7 @@ struct Splash : Component, Timer
     Splash()
     {
         setOpaque (false);
-        setSize (560, 330);
+        setSize (380, 380);
         addToDesktop (ComponentPeer::windowIsSemiTransparent | ComponentPeer::windowAppearsOnTaskbar);
         centreWithSize (getWidth(), getHeight());
         setVisible (true); toFront (true);
@@ -3424,35 +3460,34 @@ struct Splash : Component, Timer
     void paint (Graphics& g) override
     {
         auto b = getLocalBounds().toFloat().reduced (1);
-        g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 24.0f);
-        g.setColour (sw::colour::line); g.drawRoundedRectangle (b, 24.0f, 1.0f);
-        // the wave: columns of dots, height follows a travelling sine
-        const int cols = 40, rows = 9; const float dx = 11.0f, x0 = (getWidth() - (cols - 1) * dx) / 2, y0 = 70;
-        for (int c = 0; c < cols; ++c)
-        {
-            const float v = 0.5f + 0.5f * std::sin (c * 0.38f - t * 6.0f) * std::sin (c * 0.11f + t * 1.7f);
-            const int lit = 1 + (int) (v * rows);
-            for (int r = 0; r < rows; ++r)
-            {
-                const bool on = std::abs (r - rows / 2) * 2 < lit;
-                g.setColour (on ? (c % 10 == (int) (t * 20) % 10 ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
-                g.fillRoundedRectangle (x0 + c * dx - 3, y0 + r * dx - 3, 6.0f, 6.0f, 1.8f);
-            }
-        }
-        g.setColour (sw::colour::text); g.setFont (sw::display (34.0f, 0.12f));
-        g.drawText ("SOUNDWAVE", 0, 186, getWidth(), 40, Justification::centred);
-        g.setColour (sw::colour::accent); g.setFont (sw::label (10.0f));
-        g.drawText (swVersionName, 0, 228, getWidth(), 16, Justification::centred);
-        // loading bar made of dots
-        const int n = 24; const float bx = (getWidth() - n * 9.0f) / 2;
-        const int done = jmin (n, (int) (t * 30.0f));
+        g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 22.0f);
+        g.setColour (sw::colour::line); g.drawRoundedRectangle (b, 22.0f, 1.0f);
+        // big version number, dot-matrix font
+        g.setColour (sw::colour::text); g.setFont (sw::display (128.0f, 0.0f));
+        g.drawText ("0.8", 22, 92, 260, 130, Justification::centredLeft);
+        // BETA pill
+        auto pill = Rectangle<float> (270, 136, 78, 34);
+        g.setColour (sw::colour::accent); g.fillRoundedRectangle (pill, 17.0f);
+        g.setColour (sw::colour::card); g.setFont (sw::label (12.0f));
+        g.drawText ("BETA", pill, Justification::centred);
+        // loading: a row of dots that fills in
+        const int n = 26, done = jmin (n, (int) (t * 30.0f));
         for (int i = 0; i < n; ++i)
         {
-            g.setColour (i < done ? sw::colour::text : sw::colour::line);
-            g.fillRoundedRectangle (bx + i * 9.0f, 270, 5.0f, 5.0f, 1.5f);
+            g.setColour (i < done ? (i == done - 1 ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
+            g.fillRoundedRectangle (24 + i * 12.0f, 252, 6.0f, 6.0f, 1.8f);
         }
-        g.setColour (sw::colour::text2); g.setFont (sw::label (8.0f));
-        g.drawText (closing ? "LISTO" : "CARGANDO MOTOR DE AUDIO", 0, 286, getWidth(), 14, Justification::centred);
+        // name + build, logo bottom right
+        g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
+        g.drawText ("SoundWave " + String (swVersionName), 24, 300, 260, 18, Justification::centredLeft);
+        g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
+        g.drawText ((closing ? String ("LISTO") : String ("CARGANDO")) + "  ·  BUILD " + String (__DATE__).toUpperCase(), 24, 320, 260, 14, Justification::centredLeft);
+        const int w[][2] = { {0,0},{0,1},{1,2},{2,0},{2,1},{3,2},{4,0},{4,1} };   // dot W
+        for (auto& d : w)
+        {
+            g.setColour (sw::colour::text);
+            g.fillRoundedRectangle (326 + d[0] * 7.0f, 306 + d[1] * 7.0f, 5.0f, 5.0f, 1.5f);
+        }
     }
 };
 
@@ -3666,23 +3701,23 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         tour.steps = {
             { u ("BIENVENIDO"), u ("SoundWave " ) + swVersionName + u (".\nTe enseño lo esencial en un minuto. Usa las flechas o SIGUIENTE. Puedes repetirlo en AYUDA > Tour de bienvenida."), {}, {} },
             { u ("LIBRERÍA"), u ("Añade tus carpetas de samples con +. Haz clic en un sonido para escucharlo y arrástralo a una pista para usarlo."),
-              [=, this] { return area (browser); }, [=, this] { showBrowser(); browser.tabSamples.triggerClick(); } },
+              [=, this] { return area (browser); }, [=, this] { showBrowser(); browser.tabSamples.triggerClick(); }, DotButton::browser },
             { u ("PLUGINS"), u ("Busca por nombre o por tipo (compresor, reverb, delay...) y arrastra el plugin a una pista. SOUNDWAVE muestra solo los nuestros."),
-              [=, this] { return area (browser); }, [=, this] { showBrowser(); browser.tabInst.triggerClick(); } },
+              [=, this] { return area (browser); }, [=, this] { showBrowser(); browser.tabInst.triggerClick(); }, DotButton::power },
             { u ("PISTAS"), u ("Crea pistas de AUDIO (Ctrl+T) para grabar voz o guitarra, o MIDI (Ctrl+Shift+T) para sintes. La raya roja marca las MIDI."),
-              [=, this] { return area (top.addTrack); }, {} },
+              [=, this] { return area (top.addTrack); }, {}, DotButton::plus },
             { u ("CABECERA DE PISTA"), u ("M silencia, S deja sola, FX abre sus efectos y o la prepara para grabar. Haz clic en ella para seleccionarla: se pone negra."),
-              [=, this] { return area (timeline).withWidth (Timeline::headerW).withTrimmedTop (Timeline::rulerH).withHeight (220); }, {} },
+              [=, this] { return area (timeline).withWidth (Timeline::headerW).withTrimmedTop (Timeline::rulerH).withHeight (220); }, {}, DotButton::timeline },
             { u ("REGLA, LOOP Y ZOOM"), u ("Arriba ves toda la canción. Arrastra en la franja LOOP para crear el loop. En los números, arrastra arriba o abajo con la lupa para el zoom."),
-              [=, this] { return area (timeline).withTrimmedLeft (Timeline::headerW).withHeight (Timeline::rulerH); }, {} },
+              [=, this] { return area (timeline).withTrimmedLeft (Timeline::headerW).withHeight (Timeline::rulerH); }, {}, DotButton::loop },
             { u ("PLAY Y GRABAR"), u ("Espacio reproduce. R graba en la pista preparada. Haz clic en cualquier punto de una pista para mover la barra roja ahí."),
-              [=, this] { return area (top.play).getUnion (area (top.rec)); }, {} },
+              [=, this] { return area (top.play).getUnion (area (top.rec)); }, {}, DotButton::play },
             { u ("PANEL INFERIOR"), u ("Piano roll, editor de audio y cadena de plugins de la pista. Arrastra su borde de arriba para hacerlo más grande o pequeño."),
-              [=, this] { return area (top.panel); }, {} },
+              [=, this] { return area (top.panel); }, {}, DotButton::panel },
             { u ("VISTA GRID"), u ("Tab cambia entre TIMELINE y GRID, donde lanzas clips en directo como en un directo."),
-              [=, this] { return area (top.grid); }, {} },
+              [=, this] { return area (top.grid); }, {}, DotButton::grid },
             { u ("EXPORTAR"), u ("Cuando acabes, exporta tu canción a WAV o MP3. ¡A hacer música!"),
-              [=, this] { return area (top.exportBtn); }, {} } };
+              [=, this] { return area (top.exportBtn); }, {}, DotButton::exportUp } };
         addChildComponent (tour);
         tour.onDone = [] { settings().setValue ("tourDone", true); };
         if (! settings().getBoolValue ("tourDone") && ! JUCEApplication::getCommandLineParameters().contains ("test"))
