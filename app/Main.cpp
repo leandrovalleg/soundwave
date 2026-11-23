@@ -1963,6 +1963,7 @@ struct ClipGrid : Component, Timer, DragAndDropTarget, FileDragAndDropTarget
         }
     }
 
+    int neededHeight() const { return gridTop() + headerH + (NumScenes + 1) * slotH + sw::space::l + stripH + 160 + sw::space::m; }
     void resized() override
     {
         auto top = gridTop() + headerH + (NumScenes + 1) * slotH + sw::space::l;
@@ -3585,7 +3586,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         LookAndFeel::setDefaultLookAndFeel (&laf);
         addAndMakeVisible (menu);
         addAndMakeVisible (top); addAndMakeVisible (browser);
-        addAndMakeVisible (timeline); addChildComponent (grid); addAndMakeVisible (detail);
+        addAndMakeVisible (timeline); addChildComponent (gridView); gridView.setViewedComponent (&grid, false); gridView.setScrollBarsShown (true, false); addAndMakeVisible (detail);
         setupTour();
         top.timeline.onClick = [this] { showGrid (false); };
         top.grid.onClick = [this] { showGrid (true); };
@@ -3667,7 +3668,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
             case 34: tc.setPosition (te::TimePosition()); break;
             case 40: top.browser.triggerClick(); break;
             case 41: top.panel.triggerClick(); break;
-            case 42: showGrid (! grid.isVisible()); break;
+            case 42: showGrid (! gridView.isVisible()); break;
             case 43: timeline.ioToggle.triggerClick(); break;
             case 44: top.setEditing (! top.editing); break;
             case 45: top.resetLayout(); break;
@@ -3724,7 +3725,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
 
     void showGrid (bool g)
     {
-        grid.setVisible (g); timeline.setVisible (! g);
+        gridView.setVisible (g); timeline.setVisible (! g);
         top.grid.setToggleState (g, dontSendNotification); top.timeline.setToggleState (! g, dontSendNotification);
         if (g) grid.rebuild();
         grabKeyboardFocus();
@@ -3735,7 +3736,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         auto& tc = session.edit->getTransport();
         const auto c = k.getModifiers().isCommandDown();
         if (top.editing && (k == KeyPress::returnKey || k == KeyPress::escapeKey)) { menuItemSelected (44, 0); return true; }
-        if (k == KeyPress::tabKey)   { showGrid (! grid.isVisible()); return true; }
+        if (k == KeyPress::tabKey)   { showGrid (! gridView.isVisible()); return true; }
         if (k == KeyPress::spaceKey) { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); return true; }
         if (k.getTextCharacter() == 'r' && ! c) { top.rec.triggerClick(); return true; }
         if (c && k.getKeyCode() == 'T') { session.addTrack (k.getModifiers().isShiftDown()); return true; }
@@ -3775,7 +3776,8 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
             splitter.setBounds (r.removeFromBottom (8));
         }
         splitter.setVisible (detail.isVisible());
-        timeline.setBounds (r); grid.setBounds (r);
+        timeline.setBounds (r); gridView.setBounds (r);   // GRID scrolls up/down when the window is short
+        grid.setSize (r.getWidth() - (grid.neededHeight() > r.getHeight() ? gridView.getScrollBarThickness() : 0), jmax (r.getHeight(), grid.neededHeight()));
         tour.setBounds (getLocalBounds()); tour.resized();
     }
 
@@ -3838,6 +3840,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
     Browser browser { previewer, session.engine.getPluginManager().knownPluginList };
     Timeline timeline { session };
     ClipGrid grid { session };
+    Viewport gridView;
     DetailPanel detail { session };
 };
 
