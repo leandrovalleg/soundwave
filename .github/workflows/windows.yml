@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   build:
     runs-on: windows-latest
@@ -20,13 +23,15 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1   # whichever Visual Studio the runner has, x64
 
+      - uses: mozilla-actions/sccache-action@v0.0.9   # compile cache: later builds only redo what changed
+
       - name: Ninja
         shell: bash
         run: command -v ninja || choco install ninja -y
 
       - name: Build plugins (VST3)
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
           cmake --build build
 
       - name: Build MP3 encoder (LAME, LGPL)
@@ -38,7 +43,7 @@ jobs:
 
       - name: Build SoundWave app
         run: |
-          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSW_LAME_LIB="$env:GITHUB_WORKSPACE/libmp3lame.dll"
+          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DSW_LAME_LIB="$env:GITHUB_WORKSPACE/libmp3lame.dll"
           cmake --build app/build
 
       - name: Package

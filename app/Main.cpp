@@ -1,5 +1,8 @@
 // SoundWave — DAW app (v0.1). GPLv3.
 // Engine: Tracktion Engine. Look: plugins/SWDesign.h (shared with the SoundWave plugins).
+#include <atomic>
+#include <iostream>
+#include <thread>
 #include <tracktion_engine/tracktion_engine.h>
 namespace te = tracktion;
 using namespace juce;
@@ -237,18 +240,19 @@ struct Session
             if (d.isDirectory()) paths.addIfNotAlreadyThere (d);
         paths.addPath (FileSearchPath (settings().getValue ("lastPluginSearchPathVST3")));
         auto deadMans = settings().getFile().getSiblingFile ("plugin-scan-crashes.txt");
-        scanThread = std::make_unique<std::thread> ([this, vst3, paths, deadMans]
+        // One file per tick on the message thread: many VST3s must be created there.
+        // A plugin that crashes the scan is remembered in deadMans and skipped next launch.
+        scanner = std::make_unique<PluginDirectoryScanner> (engine.getPluginManager().knownPluginList, *vst3, paths, true, deadMans, false);
+        scanTimer.cb = [this]
         {
-            auto& list = engine.getPluginManager().knownPluginList;
-            PluginDirectoryScanner scanner (list, *vst3, paths, true, deadMans, false);
             String name;
-            while (! stopScan && scanner.scanNextFile (true, name)) {}
-            MessageManager::callAsync ([this] { if (onPluginsScanned) onPluginsScanned(); });
-        });
+            if (! scanner->scanNextFile (true, name)) { scanTimer.stopTimer(); scanner.reset(); if (onPluginsScanned) onPluginsScanned(); }
+        };
+        scanTimer.startTimer (20);
     }
-    ~Session() { stopScan = true; if (scanThread) scanThread->join(); }
-    std::atomic<bool> stopScan { false };
-    std::unique_ptr<std::thread> scanThread;
+    struct CallbackTimer : Timer { std::function<void()> cb; void timerCallback() override { if (cb) cb(); } };
+    std::unique_ptr<PluginDirectoryScanner> scanner;
+    CallbackTimer scanTimer;
 
     // Plugins the user put on the track (not the track's own volume/meter/send/return plumbing)
     static bool isUserPlugin (te::Plugin* p)
