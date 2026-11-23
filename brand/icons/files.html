@@ -1,0 +1,47 @@
+<html><head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@900&family=Space+Mono&display=swap"></head>
+<body style="margin:0;background:#EFEFEF;font-family:'Space Mono',monospace;padding:20px;display:flex;gap:18px">
+<script>
+const R='#D71921', K='#111111', P='#F2B8BA';   // P = pale red for "2" dots
+const F = {
+ // folders 9x7 ('1' dot, '2' pale dot)
+ folderA: ["1111.....","1..111111","1.......1","1.......1","1.......1","1.......1","111111111"],
+ folderB: ["1111.....","111111111","111111111","111111111","111111111","111111111","111111111"],
+ folderC: ["1111.....","1221111111".slice(0,9),"122222221","122222221","122222221","122222221","111111111"],
+ openA:   ["1111.....","1..11111.","1......1.","1.11111111".slice(0,9),"1.1.....1","11.....1.","1111111.."],
+ openB:   ["1111.....","1111111..","11.......","1.11111111".slice(0,9),"1.1111111","1.111111.","111111..."],
+ openC:   ["1111.....","1221111..","12.......","1.11111111".slice(0,9),"1.1222221","1.122221.","111111..."],
+ // audio files
+ wavePage:["11111..","1...11.","1....11","1..1..1","1.111.1","1..1..1","1111111"],
+ waveBars:[".......","...1...",".1.1...",".1.1.1.","11111.1",".1.1.1.",".1.1..."],
+ waveDot: ["..111..",".1...1.","1..1..1","1.111.1","1..1..1",".1...1.","..111.."],
+ arrowR:  ["1....","11...","111..","11...","1...."],
+ arrowD:  [".....","11111",".111.","..1..","....."],
+};
+function icon(g, col, h){
+  const rows=g.length, cols=g[0].length, s=h/rows;
+  const c=document.createElement('canvas'); c.width=cols*s*2; c.height=h*2; c.style.width=cols*s+'px'; c.style.height=h+'px';
+  const x=c.getContext('2d'); x.scale(2,2);
+  g.forEach((row,j)=>[...row].forEach((ch,i)=>{ if(ch==='.')return; x.fillStyle= ch==='2'? P: col; x.beginPath(); x.arc(i*s+s/2,j*s+s/2,s*0.36,0,7); x.fill(); }));
+  return c;
+}
+function panel(title, closed, open, file, fileCol){
+  const d=document.createElement('div');
+  d.style.cssText='background:#fff;border:1px solid #DADADA;border-radius:18px;padding:16px 18px;width:300px';
+  d.innerHTML='<div style="font-family:Doto;font-size:18px;margin-bottom:6px">'+title+'</div>';
+  // big preview row
+  const big=document.createElement('div'); big.style.cssText='display:flex;gap:16px;align-items:flex-end;margin:4px 0 12px';
+  big.appendChild(icon(F[closed],R,34)); big.appendChild(icon(F[open],R,34)); big.appendChild(icon(F[file],fileCol,34)); d.appendChild(big);
+  const rows=[[0,'open','Clap & Snare'],[1,'file','Clap - Crispy.wav'],[1,'file','Clap - Extra.wav'],[1,'file','Clap - Layer.wav',1],[1,'file','Snare - Air.wav'],[0,'closed','Fills'],[0,'closed','FX'],[0,'closed','Hi-Hats']];
+  for (const [ind,kind,txt,sel] of rows){
+    const r=document.createElement('div');
+    r.style.cssText='display:flex;align-items:center;gap:8px;height:23px;font-size:11.5px;border-radius:6px;padding-left:'+(4+ind*20)+'px;'+(sel?'background:#111;color:#fff':'');
+    if (kind!=='file') r.appendChild(icon(F[kind==='open'?'arrowD':'arrowR'], sel?'#fff':K, 8)); else { const sp=document.createElement('span'); sp.style.width='8px'; r.appendChild(sp); }
+    r.appendChild(kind==='file' ? icon(F[file], sel?'#fff':fileCol, 15) : icon(F[kind==='open'?open:closed], R, 13));
+    const t=document.createElement('span'); t.textContent=txt; r.appendChild(t); d.appendChild(r);
+  }
+  document.body.appendChild(d);
+}
+panel('A  CONTORNO',      'folderA','openA','wavePage', K);
+panel('B  RELLENO',       'folderB','openB','waveBars', R);
+panel('C  ROJO SUAVE',    'folderC','openC','waveDot',  K);
+</script></body></html>
