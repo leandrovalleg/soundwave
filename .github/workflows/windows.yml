@@ -124,6 +124,9 @@ jobs:
         run: |
           app=app/build/SoundWave_artefacts/Release/SoundWave.app
           [ "${{ matrix.arch }}" = arm64 ] && cp "$(brew --prefix lame)/lib/libmp3lame.dylib" "$app/Contents/MacOS/" || true   # ponytail: Homebrew LAME is arm64 only, so no MP3 export on Intel yet
+          mkdir -p "$app/Contents/PlugIns/VST3"   # our plugins travel inside the app, so SoundWave finds them without copying anything
+          cp -R build/*_artefacts/Release/VST3/*.vst3 "$app/Contents/PlugIns/VST3/"
+          for b in "$app"/Contents/PlugIns/VST3/*.vst3; do codesign --force --deep -s - "$b"; done
           codesign --force --deep -s - "$app"
           for b in build/*_artefacts/Release/VST3/*.vst3 build/*_artefacts/Release/AU/*.component; do codesign --force --deep -s - "$b"; done
 

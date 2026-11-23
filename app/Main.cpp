@@ -452,7 +452,8 @@ struct Session
         if (! vst3) return;
         FileSearchPath paths = vst3->getDefaultLocationsToSearch();
         auto exeDir = File::getSpecialLocation (File::currentExecutableFile).getParentDirectory();
-        for (auto d : { exeDir.getChildFile ("VST3"), exeDir.getParentDirectory().getChildFile ("VST3") })
+        for (auto d : { exeDir.getChildFile ("VST3"), exeDir.getParentDirectory().getChildFile ("VST3"),
+                        exeDir.getParentDirectory().getChildFile ("PlugIns/VST3") })   // last one: inside the Mac app bundle
             if (d.isDirectory()) paths.addIfNotAlreadyThere (d);
         paths.addPath (FileSearchPath (settings().getValue ("lastPluginSearchPathVST3")));
         // Only files not scanned before (the engine saves the list) and not skipped before.
