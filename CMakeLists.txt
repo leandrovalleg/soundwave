@@ -43,7 +43,9 @@ target_compile_definitions(sw_check PRIVATE JUCE_PLUGINHOST_VST3=1 JUCE_WEB_BROW
 target_link_libraries(sw_check PRIVATE juce::juce_audio_processors juce::juce_recommended_config_flags)
 
 # Screenshot helper: opens a VST3 editor on the X display (use with xvfb-run + ImageMagick import)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")   # screenshot tool for development, needs X11
 juce_add_console_app(sw_shot PRODUCT_NAME "sw_shot")
 target_sources(sw_shot PRIVATE tools/shot.cpp)
 target_compile_definitions(sw_shot PRIVATE JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_PLUGINHOST_VST3=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
 target_link_libraries(sw_shot PRIVATE X11 juce::juce_audio_processors juce::juce_recommended_config_flags)
+endif()
