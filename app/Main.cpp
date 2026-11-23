@@ -935,6 +935,8 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
 {
     static constexpr int headerW = 190, rulerH = 28;
     int rowH = 70;
+    int scrollY = 0;
+    bool scrubbing = false;
 
     Timeline (Session& s) : session (s)
     {
@@ -964,7 +966,10 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     {
         auto trs = tracks();
         for (int i = 0; i < io.size() && i < trs.size(); ++i)
+        {
             io[i]->setBounds (rowBounds (i).withLeft (getWidth() - ioW));
+            io[i]->setVisible (rowBounds (i).getY() >= rulerH - 4);   // hidden once it scrolls under the ruler
+        }
         ioToggle.setBounds (getWidth() - 52, 2, 46, rulerH - 4);
         auto r = getLocalBounds().reduced (10).removeFromBottom (26).withTrimmedRight (io.isEmpty() ? 0 : ioW).removeFromRight (4 * 40 + 30);
         for (auto* b : { &zOut, &zIn }) { b->setBounds (r.removeFromLeft (40)); r.removeFromLeft (4); }
@@ -977,8 +982,14 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
 
     float xFor (te::TimePosition t) const { return headerW + (float) (t.inSeconds() * pxPerSec) - scrollX; }
     te::TimePosition timeAt (float x) const { return te::TimePosition::fromSeconds (jmax (0.0, (x - headerW + scrollX) / pxPerSec)); }
-    int rowAt (int y) const { return (y - rulerH) / rowH; }
-    Rectangle<int> rowBounds (int i) const { return { 0, rulerH + i * rowH, getWidth(), rowH }; }
+    int rowAt (int y) const { return y < rulerH ? -1 : (y - rulerH + scrollY) / rowH; }
+    Rectangle<int> rowBounds (int i) const { return { 0, rulerH + i * rowH - scrollY, getWidth(), rowH }; }
+    void scrollBy (int dy)
+    {
+        const int maxScroll = jmax (0, tracks().size() * rowH - (getHeight() - rulerH) + 60);
+        scrollY = jlimit (0, maxScroll, scrollY + dy);
+        resized(); repaint();
+    }
     Rectangle<int> muteBox (int i) const { return rowBounds (i).withWidth (headerW).reduced (12, 0).withTrimmedTop (jmin (38, rowH - 30)).withHeight (20).withWidth (24); }
     Rectangle<int> soloBox (int i) const { return muteBox (i).translated (28, 0); }
     Rectangle<int> fxBox (int i)   const { return muteBox (i).translated (56, 0).withWidth (36); }
@@ -988,8 +999,8 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     Rectangle<float> clipBounds (int row, te::Clip& c) const
     {
         auto p = c.getPosition();
-        return Rectangle<float>::leftTopRightBottom (xFor (p.getStart()), (float) (rulerH + row * rowH + 8),
-                                                     xFor (p.getEnd()), (float) (rulerH + (row + 1) * rowH - 8));
+        auto rb = rowBounds (row);
+        return Rectangle<float>::leftTopRightBottom (xFor (p.getStart()), (float) rb.getY() + 6, xFor (p.getEnd()), (float) rb.getBottom() - 6);
     }
 
     void paint (Graphics& g) override
@@ -1011,10 +1022,13 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         }
 
         auto trs = tracks();
+        g.saveState();
+        g.reduceClipRegion (0, rulerH, getWidth(), getHeight() - rulerH);   // rows scroll under the ruler
         for (int i = 0; i < trs.size(); ++i)
         {
             auto* t = trs[i];
             auto row = rowBounds (i);
+            if (row.getBottom() < rulerH || row.getY() > getHeight()) continue;
             g.setColour (sw::colour::line); g.drawHorizontalLine (row.getBottom() - 1, 0, (float) getWidth());
 
             for (auto c : t->getClips())
@@ -1024,11 +1038,11 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
                 b.setLeft (jmax ((float) headerW, b.getX()));
                 g.setColour (sw::colour::card); g.fillRoundedRectangle (b, 8.0f);
                 g.setColour (sw::colour::text.withAlpha (0.75f));
-                waves.draw (g, *c, b.reduced (2, 6).withTrimmedTop (10), this);
+                waves.draw (g, *c, b.reduced (2, 3).withTrimmedTop (15), this);
                 g.setColour (c == selected ? sw::colour::text : sw::colour::line);
                 g.drawRoundedRectangle (b.reduced (0.5f), 8.0f, c == selected ? 1.5f : 1.0f);
                 g.setColour (sw::colour::text); g.setFont (sw::mono (11.0f));
-                g.drawText (c->getName().toUpperCase(), b.reduced (8, 4).toNearestInt(), Justification::topLeft);
+                g.drawText (c->getName().toUpperCase(), b.reduced (8, 2).removeFromTop (14).toNearestInt(), Justification::centredLeft, true);
                 if (auto mc = dynamic_cast<te::MidiClip*> (c))   // tiny note preview
                 {
                     auto area = b.reduced (6, 4).withTrimmedTop (14);
@@ -1045,13 +1059,33 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             }
 
             // header card
+            // live recording on this track: soft red region from punch-in to the playhead, waveform in white
+            if (edit().getTransport().isRecording() && Session::returnBus (*t) < 0)
+                if (auto in = session.inputOf (*t); in && Session::isAudioIn (in) && in->isRecordingEnabled (t->itemID))
+                {
+                    const auto start = in->getPunchInTime (t->itemID), now = edit().getTransport().getPosition();
+                    if (now > start)
+                    {
+                        auto rec = Rectangle<float>::leftTopRightBottom (jmax ((float) headerW, xFor (start)), (float) row.getY() + 6,
+                                                                         xFor (now), (float) row.getBottom() - 6);
+                        g.setColour (Colour (0xffe8898d)); g.fillRoundedRectangle (rec, 8.0f);
+                        if (auto th = session.engine.getRecordingThumbnailManager().getThumbnailFor (in->getRecordingFile (t->itemID)))
+                        {
+                            g.setColour (Colours::white);
+                            th->thumb->drawChannels (g, rec.reduced (2, 3).withTrimmedTop (15).toNearestInt(), 0.0, (now - start).inSeconds(), 1.0f);
+                        }
+                        g.setColour (Colours::white); g.setFont (sw::mono (10.0f));
+                        g.drawText ("REC", rec.reduced (8, 2).removeFromTop (14).toNearestInt(), Justification::centredLeft);
+                    }
+                }
+
             auto h = row.withWidth (headerW).reduced (8, 6).toFloat();
             sw::paintCard (g, h, 12.0f);
             g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
             const int rb = Session::returnBus (*t);
             if (rb >= 0) { g.setColour (sw::colour::accent); g.fillEllipse (h.getRight() - 18, h.getY() + 10, 7, 7); g.setColour (sw::colour::text); }
             g.drawText ((rb >= 0 ? String ("RET") : String (i + 1).paddedLeft ('0', 2)) + "  " + t->getName().toUpperCase(),
-                        h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredLeft);
+                        h.reduced (10, 6).removeFromTop (20).toNearestInt(), Justification::centredLeft, true);
             auto drawToggle = [&] (Rectangle<int> r, const String& s, bool on, bool red)
             {
                 g.setColour (on ? (red ? sw::colour::accent : sw::colour::text) : sw::colour::subtle);
@@ -1077,12 +1111,16 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             }
         }
 
-        // playhead
+        g.restoreState();
+
+        // playhead (drag it from the ruler or grab the line)
         auto px = xFor (edit().getTransport().getPosition());
         if (px >= headerW)
         {
             g.setColour (sw::colour::accent);
             g.fillRect ((float) px, 0.0f, 1.5f, (float) getHeight());
+            Path head; head.addTriangle ((float) px - 5, 0.0f, (float) px + 6.5f, 0.0f, (float) px + 0.75f, 7.0f);   // handle in the ruler
+            g.fillPath (head);
         }
 
         if (hasRange())   // selected time range: pale red band with red edges
@@ -1122,6 +1160,13 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     {
         auto trs = tracks();
         const int r = rowAt (e.y);
+        const bool onLine = e.x >= headerW && std::abs (e.x - xFor (edit().getTransport().getPosition())) < 5;
+        if ((e.y < rulerH && e.x >= headerW) || (onLine && ! e.mods.isPopupMenu()))
+        {
+            scrubbing = true;
+            edit().getTransport().setPosition (timeAt ((float) jmax (headerW, e.x)));
+            repaint(); return;
+        }
         if (e.y > rulerH && isPositiveAndBelow (r, trs.size()) && e.x < headerW)
         {
             auto* t = trs[r];
@@ -1227,6 +1272,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
 
     void mouseUp (const MouseEvent& e) override
     {
+        scrubbing = false;
         if (dragTrack < 0) return;
         auto regs = session.regularTracks();
         const int to = jlimit (0, regs.size() - 1, rowAt (e.y));
@@ -1239,6 +1285,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
 
     void mouseDrag (const MouseEvent& e) override
     {
+        if (scrubbing) { edit().getTransport().setPosition (timeAt ((float) jmax (headerW, e.x))); repaint(); return; }
         if (dragTrack >= 0) { dropLine = jlimit (0, session.regularTracks().size() - 1, rowAt (e.y)); repaint(); return; }
         if (! selected && rangeRow >= 0 && ! e.mods.isPopupMenu())
         {
@@ -1263,14 +1310,20 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     {
         int row; auto c = clipAt (e.getPosition(), row);
         auto edge = c && (e.x - clipBounds (row, *c).getX() < 7 || clipBounds (row, *c).getRight() - e.x < 7);
-        setMouseCursor (edge ? MouseCursor::LeftRightResizeCursor : MouseCursor::NormalCursor);
+        const bool playhead = e.x >= headerW && (e.y < rulerH || std::abs (e.x - xFor (edit().getTransport().getPosition())) < 5);
+        setMouseCursor (edge || playhead ? MouseCursor::LeftRightResizeCursor : MouseCursor::NormalCursor);
     }
 
     void mouseWheelMove (const MouseEvent& e, const MouseWheelDetails& w) override
     {
-        if (e.mods.isAltDown()) { rowH = jlimit (44, 220, rowH + (w.deltaY > 0 ? 10 : -10)); repaint(); return; }
-        if (e.mods.isCommandDown()) pxPerSec = jlimit (4.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15));
-        else scrollX = jmax (0.0f, scrollX - (w.deltaX != 0 ? w.deltaX : w.deltaY) * 300.0f);
+        // wheel: up/down · Shift+wheel or trackpad sideways: left/right · Ctrl+wheel: zoom · Alt+wheel: track height
+        if (e.mods.isAltDown()) { rowH = jlimit (36, 220, rowH + (w.deltaY > 0 ? 8 : -8)); scrollBy (0); return; }
+        if (e.mods.isCommandDown()) { pxPerSec = jlimit (4.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15)); repaint(); return; }
+        if (e.mods.isShiftDown() || std::abs (w.deltaX) > std::abs (w.deltaY))
+            scrollX = jmax (0.0f, scrollX - (w.deltaX != 0 ? w.deltaX : w.deltaY) * 300.0f);
+        else
+            scrollBy (roundToInt (-w.deltaY * 240.0f));
+        repaint();
     }
 
     void trackMenu (te::AudioTrack& t)
@@ -1936,14 +1989,14 @@ struct AudioClipEditor : Component, ChangeListener
         g.setColour (sw::colour::subtle); g.fillRoundedRectangle (w.toFloat(), 8.0f);
         if (! clip) return;
         g.setColour (sw::colour::text);
-        if (thumb.getTotalLength() > 0)
+        g.setFont (sw::display (14.0f));
+        g.drawText (clip->getName().toUpperCase(), w.reduced (10, 4).removeFromTop (18), Justification::centredLeft, true);
+        if (thumb.getTotalLength() > 0)   // waveform below the title strip
         {
             auto off = clip->getPosition().getOffset().inSeconds();
             auto len = clip->getPosition().getLength().inSeconds();
-            thumb.drawChannels (g, w.reduced (4), off, off + len, 1.0f);
+            thumb.drawChannels (g, w.reduced (4).withTrimmedTop (22), off, off + len, 1.0f);
         }
-        g.setFont (sw::display (16.0f));
-        g.drawText (clip->getName().toUpperCase(), w.reduced (10, 6), Justification::topLeft);
     }
 
     Rectangle<int> waveArea() const { return getLocalBounds().removeFromTop (getHeight() / 2 - 10).reduced (0, 4); }
