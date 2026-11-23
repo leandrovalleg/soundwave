@@ -89,6 +89,12 @@ jobs:
         with: { name: windows, path: installer/Output/SoundWave-Setup.exe }
 
   mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64,  dmg: SoundWave-Mac-AppleSilicon.dmg }
+          - { arch: x86_64, dmg: SoundWave-Mac-Intel.dmg }   # cross-built on the Apple Silicon runner
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -104,24 +110,25 @@ jobs:
       - name: Tools
         run: brew install ninja lame coreutils || true
 
-      - name: Build plugins (VST3 + AU, Apple Silicon)
+      - name: Build plugins (VST3 + AU, ${{ matrix.arch }})
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           cmake --build build
 
       - name: Build SoundWave app
         run: |
-          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake -S app -B app/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           cmake --build app/build
 
       - name: Bundle MP3 encoder and sign (ad-hoc)
         run: |
           app=app/build/SoundWave_artefacts/Release/SoundWave.app
-          cp "$(brew --prefix lame)/lib/libmp3lame.dylib" "$app/Contents/MacOS/" || true
+          [ "${{ matrix.arch }}" = arm64 ] && cp "$(brew --prefix lame)/lib/libmp3lame.dylib" "$app/Contents/MacOS/" || true   # ponytail: Homebrew LAME is arm64 only, so no MP3 export on Intel yet
           codesign --force --deep -s - "$app"
           for b in build/*_artefacts/Release/VST3/*.vst3 build/*_artefacts/Release/AU/*.component; do codesign --force --deep -s - "$b"; done
 
       - name: Test on macOS (start the app, export WAV + MP3, open the window)
+        if: matrix.arch == 'arm64'   # the runner can't run Intel code
         run: |
           exe=app/build/SoundWave_artefacts/Release/SoundWave.app/Contents/MacOS/SoundWave
           gtimeout 180 "$exe" --selftest "$PWD/demo-samples"; r=$?
@@ -139,10 +146,10 @@ jobs:
           cp -R build/*_artefacts/Release/AU/*.component dmg/Plugins/AU/
           printf 'SoundWave para Mac\n\n1. Arrastra SoundWave a Aplicaciones.\n2. La primera vez: clic derecho en SoundWave > Abrir > Abrir (la app no esta firmada por Apple).\n3. Plugins para otros DAW: copia Plugins/VST3 a ~/Library/Audio/Plug-Ins/VST3 y Plugins/AU a ~/Library/Audio/Plug-Ins/Components.\n' > dmg/LEEME.txt
           cp LICENSE dmg/
-          hdiutil create -volname SoundWave -srcfolder dmg -ov -format UDZO SoundWave-Mac.dmg
+          hdiutil create -volname SoundWave -srcfolder dmg -ov -format UDZO ${{ matrix.dmg }}
 
       - uses: actions/upload-artifact@v4
-        with: { name: mac, path: SoundWave-Mac.dmg }
+        with: { name: "mac-${{ matrix.arch }}", path: "${{ matrix.dmg }}" }
 
   publish:
     needs: [build, mac]
@@ -154,8 +161,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=$(ls windows/*.exe mac/*.dmg 2>/dev/null || true)
+          files=$(ls windows/*.exe mac-*/*.dmg 2>/dev/null || true)
           gh release delete latest --yes --cleanup-tag -R "$GITHUB_REPOSITORY" || true
           gh release create latest $files --prerelease -R "$GITHUB_REPOSITORY" \
             --title "SoundWave (última versión)" \
-            --notes "Windows: SoundWave-Setup.exe. Mac: SoundWave-Mac.dmg (abre, arrastra a Aplicaciones; la primera vez clic derecho > Abrir)."
+            --notes "Windows: SoundWave-Setup.exe. Mac M1/M2/M3/M4: SoundWave-Mac-AppleSilicon.dmg. Mac Intel: SoundWave-Mac-Intel.dmg (abre, arrastra a Aplicaciones; la primera vez clic derecho > Abrir)."
