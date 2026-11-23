@@ -1,0 +1,47 @@
+<html><head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@900&family=Space+Mono&display=swap"></head>
+<body style="margin:0;background:#EFEFEF;font-family:'Space Mono',monospace;padding:16px 20px">
+<script>
+const G={
+ play:    ["1......","121....","12221..","1222223","12221..","121....","1......"],
+ stop:    ["1111111","1222221","1222221","1222221","1222221","1222221","1111111"],
+ rec:     ["..111..",".13331.","1333331","1333331","1333331",".13331.","..111.."],
+ loop:    ["..3....",".311111","1.3...1","1.....1","1...3.1","111113.","....3.."],
+ browser: ["1111111","12....1","12....1","12....1","12....1","12....1","1111111"],
+ timeline:["1111...",".......","..33333",".......","111....",".......","...2222"],
+ grid:    ["111.333","111.333","111.333",".......","222.111","222.111","222.111"],
+};
+// tone maps per state: [main, secondary, accent]
+function glyph(name, tones, px=16){
+  const c=document.createElement('canvas'); c.width=c.height=px*2; c.style.width=c.style.height=px+'px';
+  const x=c.getContext('2d'); x.scale(2,2); const s=px/7;
+  G[name].forEach((row,j)=>[...row].forEach((ch,i)=>{ if(ch==='.')return;
+    x.fillStyle=tones[+ch-1]; const cx=i*s+s/2, cy=j*s+s/2, r=s*0.4;
+    x.beginPath(); x.roundRect(cx-r,cy-r,r*2,r*2,r*0.55); x.fill(); }));
+  return c;
+}
+const OFF={bg:'#fff',border:'#DADADA',text:'#111',tones:['#111','rgba(17,17,17,.32)','#D71921']};
+const V=[
+ ['1  NEGRO (actual)',            {bg:'#111',border:'#111',text:'#fff',tones:['#fff','rgba(255,255,255,.4)','#FF4A50']}],
+ ['2  ROJO',                      {bg:'#D71921',border:'#D71921',text:'#fff',tones:['#fff','rgba(255,255,255,.5)','#fff']}],
+ ['3  GRIS CLARO',                {bg:'#E4E4E4',border:'#E4E4E4',text:'#111',tones:['#111','rgba(17,17,17,.32)','#D71921']}],
+ ['4  ROJO SUAVE',                {bg:'rgba(215,25,33,.09)',border:'rgba(215,25,33,.35)',text:'#D71921',tones:['#D71921','rgba(215,25,33,.35)','#D71921']}],
+ ['5  BORDE NEGRO',               {bg:'#fff',border:'#111',text:'#111',tones:['#111','rgba(17,17,17,.32)','#D71921'],bw:'1.6px'}],
+ ['6  PUNTO ROJO',                {bg:'#fff',border:'#DADADA',text:'#111',tones:['#111','rgba(17,17,17,.32)','#D71921'],led:true}],
+];
+function btn(label,g,st){
+  const b=document.createElement('div');
+  b.style.cssText=`position:relative;display:inline-flex;align-items:center;gap:9px;height:34px;padding:0 14px;border:${st.bw||'1px'} solid ${st.border};background:${st.bg};color:${st.text};border-radius:10px;font-size:10px;letter-spacing:.12em;box-sizing:border-box`;
+  b.appendChild(glyph(g,st.tones));
+  const t=document.createElement('span'); t.textContent=label; b.appendChild(t);
+  if(st.led){ const d=document.createElement('span'); d.style.cssText='position:absolute;top:5px;right:6px;width:5px;height:5px;border-radius:1.5px;background:#D71921'; b.appendChild(d); }
+  return b;
+}
+for(const [title,on] of V){
+  const w=document.createElement('div'); w.style.cssText='background:#fff;border:1px solid #DADADA;border-radius:14px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:6px;flex-wrap:wrap';
+  const h=document.createElement('div'); h.textContent=title; h.style.cssText='font-family:Doto;font-size:15px;width:190px'; w.appendChild(h);
+  [['BROWSER','browser',1],['TIMELINE','timeline',1],['GRID','grid',0],['PLAY','play',1],['STOP','stop',0],['REC','rec',1],['LOOP','loop',0]]
+    .forEach(([l,g,a])=>w.appendChild(btn(l,g,a?(l==='REC'&&title.startsWith('1')?{...on,bg:'#D71921',border:'#D71921',tones:['#fff','rgba(255,255,255,.5)','#fff']}:on):OFF)));
+  document.body.appendChild(w);
+}
+const n=document.createElement('div'); n.textContent='Activos: BROWSER, TIMELINE, PLAY, REC  ·  sin activar: GRID, STOP, LOOP'; n.style.cssText='font-size:10px;color:#8A8A8A;letter-spacing:.08em'; document.body.appendChild(n);
+</script></body></html>
