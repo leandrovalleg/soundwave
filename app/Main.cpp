@@ -292,7 +292,8 @@ struct Session
         const char* names[] { "A REVERB", "B DELAY" };
         for (int bus : { 0, 1 })
         {
-            if (! returnTracks().isEmpty() && std::any_of (returnTracks().begin(), returnTracks().end(), [bus] (auto* t) { return returnBus (*t) == bus; }))
+            auto rets = returnTracks();   // one array: begin() and end() must come from the same object
+            if (std::any_of (rets.begin(), rets.end(), [bus] (auto* t) { return returnBus (*t) == bus; }))
                 continue;
             auto t = edit->insertNewAudioTrack (te::TrackInsertPoint (nullptr, te::getAllTracks (*edit).getLast()), nullptr);
             if (! t) continue;
