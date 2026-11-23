@@ -100,6 +100,13 @@ namespace launch
 // Engine UI hooks: plugin windows + running render jobs (export).
 struct SWBehaviour : ExtendedUIBehaviour
 {
+    // Plugin windows float above SoundWave: clicking the arrangement must not hide them; only their X closes them
+    std::unique_ptr<Component> createPluginWindow (te::PluginWindowState& pws) override
+    {
+        auto w = ExtendedUIBehaviour::createPluginWindow (pws);
+        if (w) w->setAlwaysOnTop (true);
+        return w;
+    }
     // Runs the job on its own thread while the message loop keeps going (the render needs it).
     // ponytail: no progress bar yet; the window just waits
     void runTaskWithProgressBar (te::ThreadPoolJobWithProgress& job) override
@@ -188,11 +195,19 @@ struct Session
     void save() { te::EditFileOperations (*edit).save (false, true, false); }
     void changed() { if (onChange) onChange(); }
 
-    te::AudioTrack* addTrack()
+    // Audio tracks record from the sound card; MIDI tracks hold an instrument and record from the keyboard.
+    static bool isMidiTrack (te::AudioTrack& t) { return t.state.getProperty ("swType").toString() == "midi" || instrumentOf (t) != nullptr; }
+    te::AudioTrack* addTrack (bool midi = false)
     {
         edit->ensureNumberOfAudioTracks (te::getAudioTracks (*edit).size() + 1);
-        prepareSlots(); changed();
-        return te::getAudioTracks (*edit).getLast();
+        auto* t = te::getAudioTracks (*edit).getLast();
+        int n = 0; for (auto o : regularTracks()) n += (isMidiTrack (*o) == midi);
+        t->state.setProperty ("swType", midi ? "midi" : "audio", nullptr);
+        t->setName (String (midi ? "MIDI " : "AUDIO ") + String (n + 1));
+        prepareSlots();
+        if (midi) for (auto in : inputs()) if (isMidiIn (in)) { setInput (*t, in); break; }
+        changed();
+        return t;
     }
 
     static void loopWholeClip (te::Clip& c)
@@ -623,6 +638,114 @@ struct Pill : TextButton
 
 //==============================================================================
 // BROWSER: your library folders, sample preview, drag onto TIMELINE or GRID
+// What kind of plugin this is, from its VST3 category and its name (used by the browser filter and tile icons)
+static String pluginType (const PluginDescription& d)
+{
+    if (d.isInstrument) return "SINTE";
+    const auto s = (d.category + " " + d.name + " " + d.descriptiveName).toLowerCase();
+    auto any = [&] (std::initializer_list<const char*> words) { for (auto* w : words) if (s.contains (w)) return true; return false; };
+    if (any ({ "dynamic", "comp", "squeeze", "limit", "wall", "gate", "expander", "transient" })) return String::fromUTF8 ("DINÁMICA");
+    if (any ({ "eq", "prism", "flux", "filter" }))                                                return "EQ / FILTRO";
+    if (any ({ "reverb", "verb", "room", "space", "hall", "plate" }))                              return "REVERB";
+    if (any ({ "delay", "echo" }))                                                                 return "DELAY";
+    if (any ({ "chorus", "flang", "phas", "swirl", "jet", "orbit", "sway", "trem", "pan", "modul" })) return String::fromUTF8 ("MODULACIÓN");
+    if (any ({ "dist", "satur", "glow", "crush", "drive", "tube", "bit", "fuzz" }))                return String::fromUTF8 ("DISTORSIÓN");
+    if (any ({ "tune", "pitch", "shift" }))                                                        return "PITCH";
+    return "OTROS";
+}
+static const StringArray pluginTypes { "TODOS", "SINTE", String::fromUTF8 ("DINÁMICA"), "EQ / FILTRO", "REVERB", "DELAY",
+                                       String::fromUTF8 ("MODULACIÓN"), String::fromUTF8 ("DISTORSIÓN"), "PITCH", "OTROS" };
+
+// Plugins as rounded tiles grouped by maker: click to select, drag onto a track, double-click to add to the selected track
+struct PluginTiles : Component
+{
+    std::vector<std::pair<String, Array<PluginDescription>>> groups;
+    std::function<void (const PluginDescription&)> onChosen;
+    String hoverId, selectedId;
+    static constexpr int headerH = 22, tileH = 64, gap = 6, cols = 3;
+
+    void setGroups (decltype (groups) g)
+    {
+        groups = std::move (g);
+        int h = 4;
+        for (auto& [maker, list] : groups) h += headerH + ((list.size() + cols - 1) / cols) * (tileH + gap) + 6;
+        setSize (getWidth(), jmax (h, 40));
+        repaint();
+    }
+    template <typename Fn> void forEachTile (Fn fn) const
+    {
+        const int tw = (getWidth() - gap * (cols - 1)) / cols;
+        int y = 4;
+        for (auto& [maker, list] : groups)
+        {
+            y += headerH;
+            for (int i = 0; i < list.size(); ++i)
+                fn (list.getReference (i), Rectangle<int> ((i % cols) * (tw + gap), y + (i / cols) * (tileH + gap), tw, tileH));
+            y += ((list.size() + cols - 1) / cols) * (tileH + gap) + 6;
+        }
+    }
+    const PluginDescription* tileAt (Point<int> p) const
+    {
+        const PluginDescription* hit = nullptr;
+        forEachTile ([&] (const PluginDescription& d, Rectangle<int> r) { if (r.contains (p)) hit = &d; });
+        return hit;
+    }
+    // 5x5 dot icon per plugin type
+    static const char* typeGlyph (const String& type)
+    {
+        if (type == "SINTE")       return "11111" "1.1.1" "1.1.1" "11111" ".....";
+        if (type == "EQ / FILTRO") return "....." "1...1" ".1.1." "..1.." ".....";
+        if (type == "REVERB")      return "11111" "1...1" "1.1.1" "1...1" "11111";
+        if (type == "DELAY")       return "....." "1.1.1" "1.1.1" "....." ".....";
+        if (type == "PITCH")       return "..1.." ".111." "..1.." "..1.." "..1..";
+        if (type.startsWith ("DIN")) return "1...." "1.1.." "1.1.1" "1.1.1" "11111";
+        if (type.startsWith ("MOD")) return "....." ".1..." "1.1.1" "...1." ".....";
+        if (type.startsWith ("DIS")) return "1...1" ".1.1." "..1.." ".1.1." "1...1";
+        return "....." ".111." ".111." ".111." ".....";
+    }
+    void paint (Graphics& g) override
+    {
+        int y = 4;
+        for (auto& [maker, list] : groups)
+        {
+            g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
+            g.drawText (maker.toUpperCase() + "  (" + String (list.size()) + ")", 2, y, getWidth(), headerH - 4, Justification::bottomLeft);
+            y += headerH + ((list.size() + cols - 1) / cols) * (tileH + gap) + 6;
+        }
+        forEachTile ([&] (const PluginDescription& d, Rectangle<int> r)
+        {
+            const auto id = d.createIdentifierString();
+            const bool sel = id == selectedId, hov = id == hoverId, native = d.manufacturerName == "SoundWave";
+            auto rf = r.toFloat().reduced (0.5f);
+            g.setColour (sel ? sw::colour::text : hov ? sw::colour::subtle : sw::colour::card); g.fillRoundedRectangle (rf, 12.0f);
+            g.setColour (sel ? sw::colour::text : sw::colour::line); g.drawRoundedRectangle (rf, 12.0f, 1.0f);
+            const auto type = pluginType (d);
+            if (auto* bits = typeGlyph (type))   // type icon, red for SoundWave's own plugins
+            {
+                g.setColour (sel ? sw::colour::card : native ? sw::colour::accent : sw::colour::text);
+                for (int i = 0; i < 25; ++i)
+                    if (bits[i] == '1') g.fillRoundedRectangle (r.getX() + 9 + (i % 5) * 3.0f, r.getY() + 9 + (i / 5) * 3.0f, 2.2f, 2.2f, 0.7f);
+            }
+            g.setColour (sel ? sw::colour::card : sw::colour::text); g.setFont (sw::mono (10.5f));
+            auto name = d.name.startsWith ("SW ") ? d.name.substring (3) : d.name;
+            g.drawFittedText (name.toUpperCase(), r.reduced (9, 0).withTrimmedTop (26).withHeight (24), Justification::topLeft, 2, 1.0f);
+            g.setColour (sel ? sw::colour::card.withAlpha (0.7f) : sw::colour::text2); g.setFont (sw::label (7.5f));
+            g.drawText (type, r.reduced (9, 6).removeFromBottom (10), Justification::bottomLeft);
+        });
+    }
+    void mouseMove (const MouseEvent& e) override { auto* d = tileAt (e.getPosition()); auto id = d ? d->createIdentifierString() : String(); if (id != hoverId) { hoverId = id; repaint(); } }
+    void mouseExit (const MouseEvent&) override { hoverId = {}; repaint(); }
+    void mouseDown (const MouseEvent& e) override { if (auto* d = tileAt (e.getPosition())) { selectedId = d->createIdentifierString(); repaint(); } }
+    void mouseDoubleClick (const MouseEvent& e) override { if (auto* d = tileAt (e.getPosition())) if (onChosen) onChosen (*d); }
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (e.getDistanceFromDragStart() < 6) return;
+        if (auto* d = tileAt (e.getMouseDownPosition()))
+            if (auto* dc = DragAndDropContainer::findParentDragContainerFor (this); dc && ! dc->isDragAndDropActive())
+                dc->startDragging ("swplugin:" + d->createIdentifierString(), this);
+    }
+};
+
 struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxModel, ChangeListener
 {
     Browser (Previewer& pv, KnownPluginList& kl) : preview (pv), known (kl)
@@ -633,9 +756,17 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
             b->onClick = [this] { refreshPlugins(); resized(); repaint(); };
         }
         tabSamples.setToggleState (true, dontSendNotification);
-        plugins.setModel (this); plugins.setRowHeight (24);
-        plugins.setColour (ListBox::backgroundColourId, sw::colour::card);
-        addChildComponent (plugins);
+        // plugin section: search, ALL/INST/FX, type filter, tiles
+        search.setTextToShowWhenEmpty ("BUSCAR PLUGIN...", sw::colour::text2);
+        search.setFont (sw::mono (12.0f));
+        search.onTextChange = [this] { refreshPlugins(); };
+        for (auto* b : { &kindAll, &kindInst, &kindFx })
+        { b->setRadioGroupId (8); b->setClickingTogglesState (true); b->onClick = [this] { refreshPlugins(); }; addChildComponent (b); }
+        kindAll.setToggleState (true, dontSendNotification);
+        typeFilter.addItemList (pluginTypes, 1); typeFilter.setSelectedId (1, dontSendNotification);
+        typeFilter.onChange = [this] { refreshPlugins(); };
+        tilesView.setViewedComponent (&tiles, false); tilesView.setScrollBarsShown (true, false);
+        for (auto* c : { (Component*) &search, (Component*) &typeFilter, (Component*) &tilesView }) addChildComponent (c);
         known.addChangeListener (this);
         for (auto* b : { &add, &remove, &previewToggle }) addAndMakeVisible (b);
         addAndMakeVisible (folders);
@@ -659,16 +790,33 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
     void changeListenerCallback (ChangeBroadcaster*) override { MessageManager::callAsync ([sp = SafePointer (this)] { if (sp) sp->refreshPlugins(); }); }
     void refreshPlugins()
     {
+        const bool nativeOnly = tabNative.getToggleState();
+        const auto q = search.getText().trim().toLowerCase();
+        const auto type = typeFilter.getSelectedItemIndex() > 0 ? typeFilter.getText() : String();
+        std::map<String, Array<PluginDescription>> byMaker;
         shown.clear();
-        const bool inst = tabInst.getToggleState();
-        for (auto& d : known.getTypes()) if (d.isInstrument == inst) shown.add (d);
-        std::sort (shown.begin(), shown.end(), [] (auto& a, auto& b)
-            { bool sa = a.manufacturerName == "SoundWave", sb = b.manufacturerName == "SoundWave";
-              return sa != sb ? sa : a.name.compareIgnoreCase (b.name) < 0; });
-        plugins.updateContent(); plugins.repaint();
+        for (auto& d : known.getTypes())
+        {
+            if (nativeOnly && d.manufacturerName != "SoundWave") continue;
+            if (kindInst.getToggleState() && ! d.isInstrument) continue;
+            if (kindFx.getToggleState() && d.isInstrument) continue;
+            if (type.isNotEmpty() && pluginType (d) != type) continue;
+            if (q.isNotEmpty() && ! (d.name + " " + d.manufacturerName).toLowerCase().contains (q)) continue;
+            byMaker[d.manufacturerName.isEmpty() ? String ("?") : d.manufacturerName].add (d);
+            shown.add (d);
+        }
+        decltype (tiles.groups) groups;
+        if (byMaker.count ("SoundWave")) groups.push_back ({ "SoundWave", byMaker["SoundWave"] });   // ours first
+        for (auto& [maker, list] : byMaker) if (maker != "SoundWave") groups.push_back ({ maker, list });
+        for (auto& [maker, list] : groups)
+            std::sort (list.begin(), list.end(), [] (auto& a, auto& b) { return a.name.compareIgnoreCase (b.name) < 0; });
+        tiles.setSize (jmax (100, tilesView.getWidth() - 10), tiles.getHeight());
+        tiles.setGroups (std::move (groups));
         const bool s = samplesTab();
         for (auto* c : { (Component*) &tree, (Component*) &folders, (Component*) &add, (Component*) &remove, (Component*) &previewToggle }) c->setVisible (s);
-        plugins.setVisible (! s);
+        for (auto* c : { (Component*) &search, (Component*) &typeFilter, (Component*) &tilesView, (Component*) &kindAll, (Component*) &kindInst, (Component*) &kindFx })
+            c->setVisible (! s);
+        repaint();
     }
     int getNumRows() override { return shown.size(); }
     void paintListBoxItem (int row, Graphics& g, int w, int h, bool selected) override
@@ -741,8 +889,8 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         g.drawText ("LIBRARY", r.reduced (16, 12).removeFromTop (24), Justification::centredLeft);
         if (! samplesTab())
         {
-            if (shown.isEmpty()) sw::paintCaption (g, "SCANNING PLUGINS...", plugins.getBounds().withHeight (30), Justification::centred);
-            else sw::paintCaption (g, "DRAG ONTO A TRACK", plugins.getBounds().withY (plugins.getBottom() + 4).withHeight (16), Justification::centredLeft);
+            if (shown.isEmpty()) sw::paintCaption (g, search.isEmpty() ? "SCANNING PLUGINS..." : "NADA ENCONTRADO", tilesView.getBounds().withHeight (30), Justification::centred);
+            else sw::paintCaption (g, String::fromUTF8 ("ARRASTRA A UNA PISTA · DOBLE CLIC = AÑADIR"), tilesView.getBounds().withY (tilesView.getBottom() + 4).withHeight (16), Justification::centredLeft);
             return;
         }
         sw::paintCaption (g, "PLACES", getLocalBounds().reduced (28).withTrimmedTop (64).removeFromTop (14));
@@ -756,10 +904,23 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
         r.removeFromTop (30);
         auto tabs = r.removeFromTop (24);
         tabSamples.setBounds (tabs.removeFromLeft (76)); tabs.removeFromLeft (3);
-        tabInst.setBounds (tabs.removeFromLeft (100)); tabs.removeFromLeft (3);
+        tabInst.setBounds (tabs.removeFromLeft (76)); tabs.removeFromLeft (3);
         tabFx.setBounds (tabs);
         r.removeFromTop (8);
-        plugins.setBounds (r.withTrimmedBottom (24));
+        {   // plugin section
+            auto p = r.withTrimmedBottom (22);
+            search.setBounds (p.removeFromTop (26)); p.removeFromTop (6);
+            auto row = p.removeFromTop (22);
+            const int kw = 44;
+            kindAll.setBounds (row.removeFromLeft (kw)); row.removeFromLeft (3);
+            kindInst.setBounds (row.removeFromLeft (kw)); row.removeFromLeft (3);
+            kindFx.setBounds (row.removeFromLeft (kw)); row.removeFromLeft (6);
+            typeFilter.setBounds (row);
+            p.removeFromTop (6);
+            tilesView.setBounds (p);
+            tiles.setSize (jmax (100, p.getWidth() - 10), tiles.getHeight());
+            tiles.setGroups (tiles.groups);
+        }
         r.removeFromTop (22);
         auto row = r.removeFromTop (28);
         remove.setBounds (row.removeFromRight (28)); row.removeFromRight (4);
@@ -774,8 +935,11 @@ struct Browser : Component, FileBrowserListener, DragAndDropContainer, ListBoxMo
     Previewer& preview;
     KnownPluginList& known;
     Array<PluginDescription> shown;
-    ListBox plugins;
-    Pill tabSamples { "SAMPLES" }, tabInst { "INSTRUMENTS" }, tabFx { "EFFECTS" };
+    TextEditor search; ComboBox typeFilter;
+    Pill kindAll { "ALL" }, kindInst { "INST" }, kindFx { "FX" };
+    Viewport tilesView; PluginTiles tiles;
+    Pill tabSamples { "SAMPLES" }, tabInst { "PLUGINS" }, tabFx { "SOUNDWAVE" };
+    Pill& tabNative = tabFx;
     ComboBox folders;
     Pill add { "+" }, remove { "-" }, previewToggle { "PREVIEW" };
     TimeSliceThread thread { "SW file scan" };
@@ -1099,6 +1263,11 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
 
             auto h = row.withWidth (headerW).reduced (8, 6).toFloat();
             sw::paintCard (g, h, 12.0f);
+            if (Session::returnBus (*t) < 0)   // type stripe: red = MIDI track, black = audio track
+            {
+                g.setColour (Session::isMidiTrack (*t) ? sw::colour::accent : sw::colour::text);
+                g.fillRoundedRectangle (h.getX() + 2.0f, h.getY() + 10, 2.5f, h.getHeight() - 20, 1.25f);
+            }
             g.setColour (sw::colour::text); g.setFont (sw::display (16.0f));
             const int rb = Session::returnBus (*t);
             if (rb >= 0) { g.setColour (sw::colour::accent); g.fillEllipse (h.getRight() - 18, h.getY() + 10, 7, 7); g.setColour (sw::colour::text); }
@@ -1307,6 +1476,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         if (dragTrack >= 0) { dropLine = jlimit (0, session.regularTracks().size() - 1, rowAt (e.y)); repaint(); return; }
         if (! selected && rangeRow >= 0 && ! e.mods.isPopupMenu())
         {
+            if (std::abs (e.getDistanceFromDragStartX()) < 8) { rangeEnd = rangeStart; repaint(); return; }   // a click is not a selection
             auto a = snapTime (timeAt ((float) e.getMouseDownX()), e.mods.isAltDown()), b = snapTime (timeAt ((float) e.x), e.mods.isAltDown());
             rangeStart = a < b ? a : b; rangeEnd = a < b ? b : a;
             repaint(); return;
@@ -1336,7 +1506,13 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     {
         // wheel: up/down · Shift+wheel or trackpad sideways: left/right · Ctrl+wheel: zoom · Alt+wheel: track height
         if (e.mods.isAltDown()) { rowH = jlimit (36, 220, rowH + (w.deltaY > 0 ? 8 : -8)); scrollBy (0); return; }
-        if (e.mods.isCommandDown()) { pxPerSec = jlimit (4.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15)); repaint(); return; }
+        if (e.mods.isCommandDown())   // zoom keeping the time under the mouse in place
+        {
+            const double t = timeAt ((float) jmax (headerW, e.x)).inSeconds();
+            pxPerSec = jlimit (4.0, 600.0, pxPerSec * (w.deltaY > 0 ? 1.15 : 1 / 1.15));
+            scrollX = jmax (0.0f, (float) (t * pxPerSec) - (float) (jmax (headerW, e.x) - headerW));
+            repaint(); return;
+        }
         if (e.mods.isShiftDown() || std::abs (w.deltaX) > std::abs (w.deltaY))
             scrollX = jmax (0.0f, scrollX - (w.deltaX != 0 ? w.deltaX : w.deltaY) * 300.0f);
         else
@@ -1708,7 +1884,7 @@ static double gridBeats (int i) { static const double v[] { 1, 0.5, 0.25, 0.125,
 static Label* caption (Component& parent, OwnedArray<Label>& store, const String& text)
 {
     auto* l = store.add (new Label ({}, text));
-    l->setFont (sw::label (9.0f)); l->setColour (Label::textColourId, sw::colour::text2);
+    l->setFont (sw::label (10.0f)); l->setColour (Label::textColourId, sw::colour::text2);
     parent.addAndMakeVisible (l); return l;
 }
 
@@ -2007,8 +2183,9 @@ struct AudioClipEditor : Component, ChangeListener
         g.setColour (sw::colour::subtle); g.fillRoundedRectangle (w.toFloat(), 8.0f);
         if (! clip) return;
         g.setColour (sw::colour::text);
-        g.setFont (sw::display (14.0f));
+        g.setFont (sw::display (15.0f));
         g.drawText (clip->getName().toUpperCase(), w.reduced (10, 4).removeFromTop (18), Justification::centredLeft, true);
+        g.setColour (sw::colour::accent);   // the waveform in SoundWave red
         if (thumb.getTotalLength() > 0)   // waveform below the title strip
         {
             auto off = clip->getPosition().getOffset().inSeconds();
@@ -2125,7 +2302,7 @@ struct DotButton : TextButton, Timer
         const float rad = iconOnly ? r.getHeight() / 2 : jmin (10.0f, r.getHeight() / 2);
         if (borderless)
         {
-            if (over || on) { g.setColour (on ? Colour (0xffe9e9e9) : C::subtle); g.fillEllipse (r); }
+            if (over || on) { g.setColour (on ? (onStyle == OnStyle::grey ? Colour (0xffe9e9e9) : C::accent.withAlpha (0.13f)) : C::subtle); g.fillEllipse (r); }
         }
         else
         {
@@ -2187,6 +2364,7 @@ struct DeviceChain : Component
         Card (Session& s, te::AudioTrack& t, te::Plugin& p) : session (s), track (&t), plugin (&p)
         {
             for (auto* b : { &power, &open, &left, &right, &dup, &del }) { b->borderless = true; addAndMakeVisible (b); }
+            power.onStyle = DotButton::OnStyle::redSoft;   // a plugin that is on shows a red power icon
             power.setClickingTogglesState (true);
             power.setToggleState (p.isEnabled(), dontSendNotification);
             power.onClick = [this] { plugin->setEnabled (power.getToggleState()); repaint(); };
@@ -2204,7 +2382,7 @@ struct DeviceChain : Component
                 k->onValueChange = [param, k] { param->setNormalisedParameter ((float) k->getValue(), sendNotification); };
                 addAndMakeVisible (k);
                 auto* l = names.add (new Label ({}, param->getParameterName().toUpperCase().substring (0, 10)));
-                l->setFont (sw::label (8.0f)); l->setJustificationType (Justification::centred);
+                l->setFont (sw::label (9.0f)); l->setJustificationType (Justification::centred);
                 l->setColour (Label::textColourId, sw::colour::text2);
                 addAndMakeVisible (l);
             }
@@ -2259,7 +2437,7 @@ struct DeviceChain : Component
             g.setColour (plugin->isEnabled() ? sw::colour::text : sw::colour::text2);
             g.setFont (sw::display (15.0f));
             g.drawText (plugin->getName().toUpperCase(), r.reduced (12, 8).removeFromTop (20).toNearestInt(), Justification::centredLeft);
-            g.setColour (plugin->isSynth() ? sw::colour::accent : sw::colour::text2); g.setFont (sw::label (8.0f));
+            g.setColour (plugin->isSynth() ? sw::colour::accent : sw::colour::text2); g.setFont (sw::label (9.0f));
             g.drawText (plugin->isSynth() ? "INSTRUMENT" : "EFFECT", r.reduced (12, 8).withTrimmedTop (20).removeFromTop (12).toNearestInt(), Justification::centredLeft);
         }
         void resized() override
@@ -2656,7 +2834,11 @@ struct TopBar : Component, Timer
         loop.onClick = [this] { transport().looping = loop.getToggleState(); };
         metro.onClick = [this] { session.edit->clickTrackEnabled = metro.getToggleState(); };
         metro.onMenu = [this] { metronomeMenu(); };
-        addTrack.onClick = [this] { session.addTrack(); };
+        addTrack.onClick = [this]
+        {
+            PopupMenu m; m.addItem (1, "Pista de audio"); m.addItem (2, "Pista MIDI");
+            m.showMenuAsync (PopupMenu::Options().withTargetComponent (addTrack), [this] (int r) { if (r > 0) session.addTrack (r == 2); });
+        };
         exportBtn.onClick = [this] { openDialog ("Export", new ExportPanel (session)); };
         settingsBtn.onClick = [this] { openDialog ("Settings", new SettingsPanel (session)); };
         syncFromEdit();
@@ -3006,6 +3188,8 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         session.onChange = [this] { grid.rebuild(); timeline.rebuildIO(); detail.refresh(); };
         session.onSelect = [this] { detail.refresh(); timeline.repaint(); };
         timeline.onMidiClipCreated = [this] { if (! detail.isVisible()) top.panel.triggerClick(); };
+        browser.tiles.onChosen = [this] (const PluginDescription& d)   // double-click a plugin: add it to the selected track
+        { if (auto t = session.selTrack ? session.selTrack : te::getAudioTracks (*session.edit).getFirst()) { session.insertPlugin (*t, d); session.changed(); } };
         top.onEditingChanged = [this] (bool e) { menu.setVisible (! e); grabKeyboardFocus(); };
         session.onPluginsScanned = [this] { browser.refreshPlugins(); };
         browser.refreshPlugins();
@@ -3034,7 +3218,8 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
                     item (6, "Ajustes...", "Ctrl+,"); m.addSeparator(); item (7, "Salir", "Alt+F4"); break;
             case 1: item (10, "Deshacer", "Ctrl+Z"); item (11, "Rehacer", "Ctrl+Y"); m.addSeparator();
                     item (12, "Cortar clip en el cursor", "Ctrl+E"); item (13, "Duplicar clip", "Ctrl+D"); item (14, "Borrar clip", "Supr"); break;
-            case 2: item (20, "Pista", "Ctrl+T"); item (21, "Clip MIDI en el cursor", "Ctrl+Shift+M"); break;
+            case 2: item (20, "Pista de audio", "Ctrl+T"); item (22, "Pista MIDI", "Ctrl+Shift+T"); m.addSeparator();
+                    item (21, "Clip MIDI en el cursor", "Ctrl+Shift+M"); break;
             case 3: item (30, "Play / pausa", "Espacio"); item (31, "Grabar", "R"); item (32, "Loop", "Ctrl+L");
                     item (33, String::fromUTF8 ("Metrónomo"), ""); item (34, "Volver al inicio", "Inicio"); break;
             case 4: item (40, "Navegador", "Ctrl+Alt+B"); item (41, "Panel inferior", "Ctrl+Alt+L"); item (42, "TIMELINE / GRID", "Tab");
@@ -3063,7 +3248,8 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
             case 12: splitAtPlayhead(); break;
             case 13: session.duplicateSelected(); break;
             case 14: deleteSelected(); break;
-            case 20: session.addTrack(); break;
+            case 20: session.addTrack (false); break;
+            case 22: session.addTrack (true); break;
             case 21: midiClipAtPlayhead(); break;
             case 30: tc.isPlaying() ? tc.stop (false, false) : tc.play (false); break;
             case 31: top.rec.triggerClick(); break;
@@ -3143,7 +3329,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         if (k == KeyPress::tabKey)   { showGrid (! grid.isVisible()); return true; }
         if (k == KeyPress::spaceKey) { tc.isPlaying() ? tc.stop (false, false) : tc.play (false); return true; }
         if (k.getTextCharacter() == 'r' && ! c) { top.rec.triggerClick(); return true; }
-        if (c && k.getKeyCode() == 'T') { session.addTrack(); return true; }
+        if (c && k.getKeyCode() == 'T') { session.addTrack (k.getModifiers().isShiftDown()); return true; }
         if (c && k.getKeyCode() == 'N') { menuItemSelected (1, 0); return true; }
         if (c && k.getKeyCode() == 'O') { menuItemSelected (2, 0); return true; }
         if (c && k.getModifiers().isShiftDown() && k.getKeyCode() == 'S') { menuItemSelected (4, 0); return true; }
