@@ -3480,8 +3480,8 @@ struct Splash : Component, Timer
         // official logo: the icon with the SoundWave name beside it, build line underneath
         static const Image icon = ImageCache::getFromMemory (BinaryData::icon_png, BinaryData::icon_pngSize);
         g.drawImageWithin (icon, 24, 296, 44, 44, RectanglePlacement::centred);
-        g.setColour (sw::colour::text); g.setFont (sw::mono (20.0f));
-        g.drawText ("SoundWave", 78, 298, 260, 24, Justification::centredLeft);
+        g.setColour (sw::colour::text); g.setFont (sw::display (24.0f));   // same dot wordmark as the app's top bar
+        g.drawText ("SOUNDWAVE", 78, 296, 280, 26, Justification::centredLeft);
         g.setColour (sw::colour::text2); g.setFont (sw::label (9.0f));
         g.drawText ((closing ? String ("LISTO") : String ("CARGANDO")) + "  ·  BUILD " + String (__DATE__).toUpperCase(), 78, 322, 260, 14, Justification::centredLeft);
     }
