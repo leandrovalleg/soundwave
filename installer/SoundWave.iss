@@ -12,6 +12,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 WizardStyle=modern
+; SoundWave look: dot-grid artwork (one file per Windows scaling level) + colours set in [Code]
+WizardImageFile=art\wizard-164x314.bmp,art\wizard-246x459.bmp,art\wizard-328x628.bmp,art\wizard-410x797.bmp
+WizardSmallImageFile=art\small-55x55.bmp,art\small-83x80.bmp,art\small-110x106.bmp,art\small-138x140.bmp
+WizardImageStretch=no
+WizardImageBackColor=$EFEFEF
 LicenseFile=..\LICENSE
 Compression=lzma2
 SolidCompression=yes
@@ -35,3 +40,18 @@ Name: "{autodesktop}\SoundWave"; Filename: "{app}\SoundWave.exe"; Tasks: desktop
 
 [Run]
 Filename: "{app}\SoundWave.exe"; Description: "{cm:LaunchProgram,SoundWave}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// SoundWave colours (Inno Setup colours are written $BBGGRR): light grey ground, white pages, black text, red accent
+procedure InitializeWizard;
+begin
+  WizardForm.Color := $EFEFEF;
+  WizardForm.MainPanel.Color := $FFFFFF;
+  WizardForm.InnerPage.Color := $FFFFFF;
+  WizardForm.WelcomePage.Color := $EFEFEF;
+  WizardForm.FinishedPage.Color := $EFEFEF;
+  WizardForm.PageNameLabel.Font.Color := $111111;
+  WizardForm.PageDescriptionLabel.Font.Color := $8A8A8A;
+  WizardForm.WelcomeLabel1.Font.Color := $2119D7;
+  WizardForm.FinishedHeadingLabel.Font.Color := $2119D7;
+end;
