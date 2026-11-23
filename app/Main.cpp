@@ -5,6 +5,8 @@
 #include <thread>
 #include <tracktion_engine/tracktion_engine.h>
 namespace te = tracktion;
+// Declared in the engine's internal tracktion_ClickNode.h (compiled into the engine, not in its public headers)
+namespace tracktion::inline engine::Click { void setClickWaveFile (Engine&, bool big, const juce::String& filename); }
 using namespace juce;
 using namespace tracktion::literals;
 #include "../tracktion_engine/examples/common/PluginWindow.h"   // Tracktion example helper: hosts plugin editors in windows
@@ -146,6 +148,8 @@ struct Session
         if (! f.existsAsFile()) edit->ensureNumberOfAudioTracks (4);
         prepareSlots();
         ensureAudioDevice();
+        static bool clickReady = false;
+        if (! clickReady) { clickReady = true; setClickSound (settings().getIntValue ("clickSound", 0)); }
         edit->getTransport().ensureContextAllocated();
         settings().setValue ("lastProject", f.getFullPathName()); settings().saveIfNeeded();
         changed(); if (onSelect) onSelect();
@@ -317,6 +321,42 @@ struct Session
         }
         tc.record (false, false);
         changed();
+    }
+
+    // ---- metronome sounds, synthesised and written next to the settings; the engine plays them
+    static inline const StringArray clickSounds { String::fromUTF8 ("CLÁSICO"), "MADERA", "HI-HAT", "BEEP" };
+    void setClickSound (int kind)
+    {
+        kind = jlimit (0, clickSounds.size() - 1, kind);
+        settings().setValue ("clickSound", kind); settings().saveIfNeeded();
+        for (bool big : { true, false })
+        {
+            const double sr = 44100; const int n = (int) (0.07 * sr);
+            AudioBuffer<float> b (1, n);
+            Random rnd (big ? 1 : 2); float prev = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double t = i / sr;
+                float v = 0;
+                switch (kind)
+                {
+                    case 0: v = (float) std::sin (2 * MathConstants<double>::pi * (big ? 2000 : 1500) * t) * (float) std::exp (-t * 90); break;
+                    case 1: { float nz = rnd.nextFloat() * 2 - 1; prev = prev * 0.6f + nz * 0.4f;
+                              v = (prev * 0.6f + (float) std::sin (2 * MathConstants<double>::pi * (big ? 900 : 650) * t)) * (float) std::exp (-t * 140); } break;
+                    case 2: { float nz = rnd.nextFloat() * 2 - 1; v = (nz - prev) * (float) std::exp (-t * (big ? 70 : 110)); prev = nz; } break;
+                    default: v = (std::sin (2 * MathConstants<double>::pi * (big ? 1600 : 1000) * t) > 0 ? 0.5f : -0.5f) * (t < 0.04 ? 1.0f : 0.0f); break;
+                }
+                b.setSample (0, i, v * (big ? 0.9f : 0.6f));
+            }
+            auto f = settings().getFile().getSiblingFile (String ("click-") + (big ? "big" : "small") + ".wav");
+            f.deleteFile();
+            WavAudioFormat wav;
+            if (auto out = std::unique_ptr<OutputStream> (f.createOutputStream()))
+                if (auto w = std::unique_ptr<AudioFormatWriter> (wav.createWriterFor (out.get(), sr, 1, 16, {}, 0)))
+                { out.release(); w->writeFromAudioSampleBuffer (b, 0, n); }
+            te::Click::setClickWaveFile (engine, big, f.getFullPathName());
+        }
+        if (edit) edit->restartPlayback();
     }
 
     // If no sound card is open (e.g. WASAPI exclusive failed because another app holds it), fall back to the
@@ -1045,6 +1085,15 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             g.fillRect ((float) px, 0.0f, 1.5f, (float) getHeight());
         }
 
+        if (hasRange())   // selected time range: pale red band with red edges
+        {
+            auto row = rowBounds (rangeRow);
+            auto band = Rectangle<float>::leftTopRightBottom (jmax ((float) headerW, xFor (rangeStart)), (float) row.getY() + 2,
+                                                              xFor (rangeEnd), (float) row.getBottom() - 2);
+            g.setColour (sw::colour::accent.withAlpha (0.12f)); g.fillRect (band);
+            g.setColour (sw::colour::accent);
+            g.fillRect (band.withWidth (1.5f)); g.fillRect (band.withLeft (band.getRight() - 1.5f));
+        }
         if (dropLine >= 0 && dropLine != dragTrack)   // where the dragged track will land
         {
             g.setColour (sw::colour::accent);
@@ -1104,13 +1153,51 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
             dragMode = e.x - b.getX() < 7 ? trimLeft : b.getRight() - e.x < 7 ? trimRight : moveClip;
             return;
         }
-        if (e.x >= headerW) edit().getTransport().setPosition (timeAt ((float) e.x));
+        if (e.x < headerW) return;
+        if (e.mods.isPopupMenu() && hasRange() && rangeRow == rowAt (e.y)) { rangeMenu(); return; }
+        edit().getTransport().setPosition (timeAt ((float) e.x));
+        rangeRow = isPositiveAndBelow (rowAt (e.y), trs.size()) ? rowAt (e.y) : -1;   // drag to select a time range
+        rangeStart = rangeEnd = snapTime (timeAt ((float) e.x), e.mods.isAltDown());
+        if (e.mods.isPopupMenu() && rangeRow >= 0) rangeMenu();
+        repaint();
+    }
+
+    // ---- time range on one track (drag on an empty lane): Ctrl+Shift+M, double-click or right-click makes a MIDI clip
+    int rangeRow = -1;
+    te::TimePosition rangeStart, rangeEnd;
+    bool hasRange() const { return rangeRow >= 0 && rangeEnd > rangeStart; }
+    te::TimePosition snapTime (te::TimePosition t, bool free)
+    {
+        if (free) return t;
+        auto& ts = edit().tempoSequence;
+        return ts.toTime (te::BeatPosition::fromBeats (std::round (ts.toBeats (t).inBeats() * 4) / 4));
+    }
+    bool createMidiFromRange()
+    {
+        auto trs = tracks();
+        if (! hasRange() || ! isPositiveAndBelow (rangeRow, trs.size())) return false;
+        if (auto mc = te::insertMIDIClip (*trs[rangeRow], "MIDI", { rangeStart, rangeEnd }))
+        {
+            selected = mc.get(); rangeRow = -1;
+            session.select (trs[rangeRow < 0 ? tracks().indexOf (dynamic_cast<te::AudioTrack*> (mc->getTrack())) : rangeRow], mc.get());
+            session.changed();
+            if (onMidiClipCreated) onMidiClipCreated();
+        }
+        return true;
+    }
+    std::function<void()> onMidiClipCreated;
+    void rangeMenu()
+    {
+        PopupMenu m;
+        m.addItem (1, "Crear clip MIDI", hasRange());
+        m.showMenuAsync ({}, [this] (int r) { if (r == 1) createMidiFromRange(); });
     }
 
     // Double-click on empty lane: new 1-bar MIDI clip there (for instruments)
     void mouseDoubleClick (const MouseEvent& e) override
     {
         int row; if (clipAt (e.getPosition(), row) || e.x < headerW) return;
+        if (hasRange() && row == rangeRow && timeAt ((float) e.x) >= rangeStart && timeAt ((float) e.x) <= rangeEnd) { createMidiFromRange(); return; }
         auto trs = tracks();
         if (! isPositiveAndBelow (row, trs.size())) return;
         auto& ts = edit().tempoSequence;
@@ -1118,7 +1205,7 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
         auto start = ts.toTime (te::tempo::BarsAndBeats { .bars = bar });
         auto end = ts.toTime (te::tempo::BarsAndBeats { .bars = bar + 1 });
         if (auto mc = te::insertMIDIClip (*trs[row], "MIDI", { start, end }))
-        { selected = mc.get(); session.select (trs[row], mc.get()); session.changed(); }
+        { selected = mc.get(); session.select (trs[row], mc.get()); session.changed(); if (onMidiClipCreated) onMidiClipCreated(); }
     }
 
     void inputMenu (te::AudioTrack& t)
@@ -1153,6 +1240,12 @@ struct Timeline : Component, Timer, DragAndDropTarget, FileDragAndDropTarget, Ch
     void mouseDrag (const MouseEvent& e) override
     {
         if (dragTrack >= 0) { dropLine = jlimit (0, session.regularTracks().size() - 1, rowAt (e.y)); repaint(); return; }
+        if (! selected && rangeRow >= 0 && ! e.mods.isPopupMenu())
+        {
+            auto a = snapTime (timeAt ((float) e.getMouseDownX()), e.mods.isAltDown()), b = snapTime (timeAt ((float) e.x), e.mods.isAltDown());
+            rangeStart = a < b ? a : b; rangeEnd = a < b ? b : a;
+            repaint(); return;
+        }
         if (! selected || e.mods.isPopupMenu()) return;
         auto from = dragMode == trimRight ? dragEnd : dragStart;
         auto t = te::TimePosition::fromSeconds (jmax (0.0, from.inSeconds() + e.getDistanceFromDragStartX() / pxPerSec));
@@ -2280,7 +2373,8 @@ struct BpmBox : Component
 // Pill button with a small dot-matrix glyph (5x5) before its label, in the same style as the logo
 struct DotButton : TextButton
 {
-    enum Glyph { none, play, stop, rec, loop, click, browser, panel, timeline, grid, plus, gear, exportUp };
+    enum Glyph { none, play, stop, rec, loop, click, browser, panel, timeline, grid, plus, gear, exportUp, chevron, metro };
+    int beatLight = 0;   // metro: 0 idle, 1 first beat of the bar, 2 other beats
     DotButton (const String& label, Glyph g, const String& tip) : TextButton (label), glyph (g) { setTooltip (tip); setWantsKeyboardFocus (false); }
 
     // 7x7 dot glyphs, row by row ('1' = dot)
@@ -2300,6 +2394,8 @@ struct DotButton : TextButton
             case plus     : return "...1......1......1...1111111...1......1......1...";
             case gear     : return "1..1..1.11111..1...1.11...11.1...1..11111.1..1..1";
             case exportUp : return "...1.....111...1.1.1....1......1...1.....11111111";
+            case chevron  : return "..............1.....1.1...1...1.1.....1..........";
+            case metro    : return ".................................................";   // drawn by hand below
             default:       return nullptr;
         }
     }
@@ -2318,6 +2414,15 @@ struct DotButton : TextButton
             g.setColour (glyph == rec && ! getToggleState() ? sw::colour::accent : col);
             for (int i = 0; i < 49 && bits[i]; ++i)
                 if (bits[i] == '1') g.fillEllipse (x + (i % 7) * step, y0 + (i / 7) * step, dot, dot);
+            if (glyph == metro)   // two dots: left lights red on beat 1, right lights on the other beats
+            {
+                const float d = step * 2.4f, cy = getHeight() / 2.0f;
+                auto dim = col.withAlpha (0.25f);
+                g.setColour (beatLight == 1 ? sw::colour::accent : beatLight == 2 ? dim : col);
+                g.fillEllipse (x + step * 0.2f, cy - d / 2, d, d);
+                g.setColour (beatLight == 2 ? col : beatLight == 1 ? dim : col);
+                g.fillEllipse (x + step * 4.0f, cy - d / 2, d, d);
+            }
             x += glyphW;
         }
         g.setColour (col); g.setFont (font);
@@ -2331,7 +2436,7 @@ struct TopBar : Component, Timer
 {
     TopBar (Session& s) : session (s)
     {
-        for (auto* b : std::initializer_list<Component*> { &browser, &panel, &timeline, &grid, &tap, &bpm, &sig, &metro, &quant,
+        for (auto* b : std::initializer_list<Component*> { &browser, &panel, &timeline, &grid, &tap, &bpm, &sig, &metro, &metroOpts, &quant,
                                                           &play, &stop, &rec, &loop, &loopLen, &key, &scale, &addTrack, &exportBtn, &settingsBtn })
             addAndMakeVisible (b);
         for (auto* b : { &browser, &panel, &metro, &loop }) b->setClickingTogglesState (true);
@@ -2368,6 +2473,7 @@ struct TopBar : Component, Timer
         rec.onClick  = [this] { session.toggleRecord(); };
         loop.onClick = [this] { transport().looping = loop.getToggleState(); };
         metro.onClick = [this] { session.edit->clickTrackEnabled = metro.getToggleState(); };
+        metroOpts.onClick = [this] { metronomeMenu(); };
         addTrack.onClick = [this] { session.addTrack(); };
         exportBtn.onClick = [this] { openDialog ("Export", new ExportPanel (session)); };
         settingsBtn.onClick = [this] { openDialog ("Settings", new SettingsPanel (session)); };
@@ -2390,6 +2496,35 @@ struct TopBar : Component, Timer
         int qi = 1; for (int i = 0; i < 6; ++i) if (session.edit->getLaunchQuantisation().type.get() == q[i]) qi = i;
         quant.setSelectedItemIndex (qi, dontSendNotification);
         metro.setToggleState (session.edit->clickTrackEnabled.get(), dontSendNotification);
+    }
+
+    void metronomeMenu()
+    {
+        auto& e = *session.edit;
+        PopupMenu m, sound, vol, count;
+        const int cur = settings().getIntValue ("clickSound", 0);
+        for (int i = 0; i < Session::clickSounds.size(); ++i) sound.addItem (10 + i, Session::clickSounds[i], true, i == cur);
+        for (int i = 1; i <= 4; ++i) vol.addItem (20 + i, String (i * 25) + " %", true, std::abs (e.getClickTrackVolume() - i * 0.25f) < 0.05f);
+        const auto ci = e.getCountInMode();
+        count.addItem (30, "NADA", true, ci == te::Edit::CountIn::none);
+        count.addItem (31, String::fromUTF8 ("1 COMPÁS"), true, ci == te::Edit::CountIn::oneBar);
+        count.addItem (32, String::fromUTF8 ("2 COMPASES"), true, ci == te::Edit::CountIn::twoBar);
+        m.addSubMenu ("SONIDO", sound);
+        m.addSubMenu ("VOLUMEN", vol);
+        m.addSubMenu (String::fromUTF8 ("CUENTA PREVIA AL GRABAR"), count);
+        m.addItem (40, "ACENTO EN EL 1", true, e.clickTrackEmphasiseBars.get());
+        m.addItem (41, "SOLO AL GRABAR", true, e.clickTrackRecordingOnly.get());
+        m.showMenuAsync (PopupMenu::Options().withTargetComponent (metroOpts), [this] (int r)
+        {
+            auto& ed = *session.edit;
+            if (r >= 10 && r < 20) session.setClickSound (r - 10);
+            else if (r > 20 && r <= 24) ed.setClickTrackVolume ((r - 20) * 0.25f);
+            else if (r == 30) ed.setCountInMode (te::Edit::CountIn::none);
+            else if (r == 31) ed.setCountInMode (te::Edit::CountIn::oneBar);
+            else if (r == 32) ed.setCountInMode (te::Edit::CountIn::twoBar);
+            else if (r == 40) ed.clickTrackEmphasiseBars = ! ed.clickTrackEmphasiseBars.get();
+            else if (r == 41) ed.clickTrackRecordingOnly = ! ed.clickTrackRecordingOnly.get();
+        });
     }
 
     void setLoopFromPlayhead (int bars)
@@ -2419,6 +2554,9 @@ struct TopBar : Component, Timer
         if (! bpm.isMouseButtonDown() && ! bpm.editor.isVisible()) bpm.setValue (session.edit->tempoSequence.getTempos()[0]->getBpm());
         auto& ts = session.edit->tempoSequence;
         auto bb = ts.toBarsAndBeats (tc.getPosition());
+        const int light = tc.isPlaying() && session.edit->clickTrackEnabled.get() && bb.getFractionalBeats().inBeats() < 0.35
+                            ? (bb.getWholeBeats() == 0 ? 1 : 2) : 0;
+        if (light != metro.beatLight) { metro.beatLight = light; metro.repaint(); }
         auto pos = String (bb.bars + 1) + "." + String (bb.getWholeBeats() + 1) + "." + String ((int) (bb.getFractionalBeats().inBeats() * 4) + 1);
         auto lr = tc.getLoopRange();
         auto lp = String (ts.toBarsAndBeats (lr.getStart()).bars + 1) + " > " + String (ts.toBarsAndBeats (lr.getEnd()).bars + 1);
@@ -2459,7 +2597,8 @@ struct TopBar : Component, Timer
         tap.setBounds (r.removeFromLeft (52)); gap (4);
         bpm.setBounds (r.removeFromLeft (110)); gap (4);
         sig.setBounds (r.removeFromLeft (78)); gap (4);
-        metro.setBounds (r.removeFromLeft (84)); gap (4);
+        metro.setBounds (r.removeFromLeft (80)); gap (2);
+        metroOpts.setBounds (r.removeFromLeft (28)); gap (4);
         quant.setBounds (r.removeFromLeft (84));
         div();
         for (auto* b : { &play, &stop, &rec }) { b->setBounds (r.removeFromLeft (b == &rec ? 70 : 76)); gap (4); }
@@ -2476,7 +2615,8 @@ struct TopBar : Component, Timer
     Session& session;
     DotButton browser { "BROWSER", DotButton::browser, "Navegador (Ctrl+Alt+B)" }, panel { "PANEL", DotButton::panel, "Panel inferior (Ctrl+Alt+L)" },
               timeline { "TIMELINE", DotButton::timeline, "Vista TIMELINE (Tab)" }, grid { "GRID", DotButton::grid, "Vista GRID (Tab)" },
-              metro { "CLICK", DotButton::click, String::fromUTF8 ("Metr\xc3\xb3nomo") }, play { "PLAY", DotButton::play, "Play / pausa (Espacio)" },
+              metro { "CLICK", DotButton::metro, String::fromUTF8 ("Metr\xc3\xb3nomo") },
+              metroOpts { "", DotButton::chevron, String::fromUTF8 ("Opciones del metr\xc3\xb3nomo: sonido, volumen, acento, cuenta previa") }, play { "PLAY", DotButton::play, "Play / pausa (Espacio)" },
               stop { "STOP", DotButton::stop, "Stop (dos veces: volver al inicio)" },
               rec { "REC", DotButton::rec, "Grabar (R): si no hay ninguna pista armada, arma la seleccionada" },
               loop { "LOOP", DotButton::loop, "Loop (Ctrl+L)" }, addTrack { "TRACK", DotButton::plus, "Nueva pista (Ctrl+T)" },
@@ -2557,6 +2697,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
         top.panel.onClick = [this] { detail.setVisible (top.panel.getToggleState()); resized(); };
         session.onChange = [this] { grid.rebuild(); timeline.rebuildIO(); detail.refresh(); };
         session.onSelect = [this] { detail.refresh(); timeline.repaint(); };
+        timeline.onMidiClipCreated = [this] { if (! detail.isVisible()) top.panel.triggerClick(); };
         session.onPluginsScanned = [this] { browser.refreshPlugins(); };
         browser.refreshPlugins();
         session.scanPluginsInBackground();
@@ -2668,6 +2809,7 @@ struct MainComponent : Component, DragAndDropContainer, MenuBarModel
     }
     void midiClipAtPlayhead()
     {
+        if (timeline.createMidiFromRange()) return;
         auto t = session.selTrack ? session.selTrack.get() : session.regularTracks().getFirst();
         if (t) session.addMidiClip (*t, session.edit->tempoSequence.toBarsAndBeats (session.edit->getTransport().getPosition()).bars);
     }
