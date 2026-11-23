@@ -10,7 +10,8 @@ juce_add_gui_app(SoundWave
     COMPANY_NAME "SoundWave"
     NEEDS_CURL FALSE
     NEEDS_WEB_BROWSER FALSE
-    MICROPHONE_PERMISSION_ENABLED TRUE)
+    MICROPHONE_PERMISSION_ENABLED TRUE
+    ICON_BIG ../brand/icon.png)
 
 juce_add_binary_data(SWAppFonts SOURCES
     ../fonts/Doto.ttf ../fonts/SpaceMono-Regular.ttf ../fonts/SpaceMono-Bold.ttf)

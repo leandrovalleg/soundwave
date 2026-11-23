@@ -239,21 +239,57 @@ struct Session
         for (auto d : { exeDir.getChildFile ("VST3"), exeDir.getParentDirectory().getChildFile ("VST3") })
             if (d.isDirectory()) paths.addIfNotAlreadyThere (d);
         paths.addPath (FileSearchPath (settings().getValue ("lastPluginSearchPathVST3")));
-        auto deadMans = settings().getFile().getSiblingFile ("plugin-scan-crashes.txt");
-        // One file per tick on the message thread: many VST3s must be created there.
-        // A plugin that crashes the scan is remembered in deadMans and skipped next launch.
-        scanner = std::make_unique<PluginDirectoryScanner> (engine.getPluginManager().knownPluginList, *vst3, paths, true, deadMans, false);
-        scanTimer.cb = [this]
+        // Only files not scanned before (the engine saves the list) and not skipped before.
+        auto& list = pm.knownPluginList;
+        StringArray todo;
+        for (auto& f : vst3->searchPathsForPlugins (paths, true, true))
+            if (! list.isListingUpToDate (f, *vst3) && ! list.getBlacklistedFiles().contains (f)) todo.add (f);
+        Logger::writeToLog ("scan: " + String (todo.size()) + " new plugin files");
+        if (todo.isEmpty()) { if (onPluginsScanned) onPluginsScanned(); return; }
+
+        // Each file is loaded by a separate copy of SoundWave (--scanone), like Ableton does: a plugin that
+        // hangs, shows a dialog (licence/authorisation windows) or crashes only takes that helper down.
+        // The window keeps responding; a file that fails or takes over 30 s is skipped from then on.
+        scanThread = std::make_unique<std::thread> ([this, todo]
         {
-            String name;
-            Logger::writeToLog ("scan: " + scanner->getNextPluginFileThatWillBeScanned());
-            if (! scanner->scanNextFile (true, name)) { scanTimer.stopTimer(); scanner.reset(); if (onPluginsScanned) onPluginsScanned(); }
-        };
-        scanTimer.startTimer (20);
+            auto exe = File::getSpecialLocation (File::currentExecutableFile).getFullPathName();
+            auto out = settings().getFile().getSiblingFile ("scan-result.xml");
+            for (auto& f : todo)
+            {
+                if (stopScan) break;
+                out.deleteFile();
+                ChildProcess p;
+                const bool ok = p.start (StringArray { exe, "--scanone", f, out.getFullPathName() }, 0)
+                                && p.waitForProcessToFinish (30000) && p.getExitCode() == 0;
+                if (! ok) p.kill();
+                std::shared_ptr<XmlElement> xml (ok ? parseXML (out).release() : nullptr);
+                Logger::writeToLog ((xml ? "scan ok: " : "scan skipped: ") + f);
+                // ponytail: posts to the message thread with `this`; fine because the thread is joined before Session dies
+                MessageManager::callAsync ([this, f, xml]
+                {
+                    auto& kl = engine.getPluginManager().knownPluginList;
+                    if (! xml) { kl.addToBlacklist (f); return; }
+                    for (auto* e : xml->getChildIterator()) { PluginDescription d; if (d.loadFromXml (*e)) kl.addType (d); }
+                });
+            }
+            MessageManager::callAsync ([this] { if (onPluginsScanned) onPluginsScanned(); });
+        });
     }
-    struct CallbackTimer : Timer { std::function<void()> cb; void timerCallback() override { if (cb) cb(); } };
-    std::unique_ptr<PluginDirectoryScanner> scanner;
-    CallbackTimer scanTimer;
+
+    // Child side of the scan: load one plugin file, write what it contains, exit.
+    static bool scanOne (const String& file, const File& out)
+    {
+        VST3PluginFormat fmt;
+        OwnedArray<PluginDescription> found;
+        fmt.findAllTypesForFile (found, file);
+        XmlElement root ("PLUGINS");
+        for (auto* d : found) root.addChildElement (d->createXml().release());
+        return ! found.isEmpty() && root.writeTo (out);
+    }
+
+    ~Session() { stopScan = true; if (scanThread) scanThread->join(); }
+    std::atomic<bool> stopScan { false };
+    std::unique_ptr<std::thread> scanThread;
 
     // Plugins the user put on the track (not the track's own volume/meter/send/return plumbing)
     static bool isUserPlugin (te::Plugin* p)
@@ -2046,6 +2082,10 @@ struct SoundWaveApp : JUCEApplication
 
     void initialise (const String& args) override
     {
+        auto argv = getCommandLineParameterArray();
+        if (argv[0] == "--scanone")   // helper process for the plugin scan; no window, no log
+        { setApplicationReturnValue (Session::scanOne (argv[1], File (argv[2])) ? 0 : 1); quit(); return; }
+
         // Log file next to the settings (%APPDATA%\SoundWave\SoundWave.log): startup steps, plugin scan, crashes.
         logger.reset (new FileLogger (settings().getFile().getSiblingFile ("SoundWave.log"), "SoundWave " + getApplicationVersion(), 512 * 1024));
         Logger::setCurrentLogger (logger.get());
