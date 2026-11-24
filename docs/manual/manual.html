@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>SoundWave Manual</title>
+<style>
+@font-face{font-family:Doto;src:url(Doto.ttf)}
+@font-face{font-family:Mono;src:url(SpaceMono-Regular.ttf)}
+@font-face{font-family:Mono;src:url(SpaceMono-Bold.ttf);font-weight:700}
+@page{size:A4;margin:0}
+:root{--bg:#efefef;--card:#fff;--ink:#111;--ink2:#8a8a8a;--line:#e2e2e2;--red:#e11d1d;--sub:#f4f4f4}
+*{box-sizing:border-box}
+body{margin:0;font-family:Mono,monospace;color:var(--ink);font-size:9.6pt;line-height:1.5}
+.page{width:210mm;height:297mm;padding:12mm;background:var(--bg);background-image:radial-gradient(#cfcfcf .7px,transparent .8px);background-size:4mm 4mm;
+  page-break-after:always;position:relative;overflow:hidden;display:flex;flex-direction:column;gap:4mm}
+.grid{display:grid;gap:4mm;flex:1;min-height:0}
+.c{background:var(--card);border-radius:6mm;padding:6mm;border:1px solid var(--line);overflow:hidden;position:relative}
+.c.dark{background:var(--ink);color:#fff;border-color:var(--ink)}
+.c.red{background:var(--red);color:#fff;border-color:var(--red)}
+.c.shot{padding:0;background:#fff}
+.c.shot img{width:100%;height:100%;object-fit:cover;object-position:top left;display:block}
+.c.fit img{object-fit:contain;background:#fff}
+h1,h2,h3{font-family:Doto;font-weight:900;margin:0;letter-spacing:.04em;line-height:1}
+h1{font-size:46pt}
+h2{font-size:22pt;margin-bottom:3mm}
+h3{font-size:14pt;margin-bottom:2mm}
+.lab{font-size:7pt;letter-spacing:.22em;color:var(--ink2);text-transform:uppercase;margin-bottom:2mm}
+.dark .lab{color:#9a9a9a}.red .lab{color:#ffd0d0}.red li::marker{color:#fff}.dark li::marker{color:var(--red)}
+.num{position:absolute;top:5mm;right:6mm;font-family:Doto;font-weight:900;font-size:13pt;color:var(--red)}
+.dark .num{color:var(--red)}
+p{margin:0 0 2mm}
+ul{margin:0;padding-left:4mm}li{margin-bottom:1.2mm}
+li::marker{color:var(--red);content:"• "}
+kbd{font-family:Mono;font-size:8pt;border:1px solid var(--line);border-radius:2mm;padding:.2mm 1.6mm;background:var(--sub);white-space:nowrap}
+.dark kbd{background:#222;border-color:#333;color:#fff}
+.foot{display:flex;justify-content:space-between;font-size:7pt;letter-spacing:.2em;color:var(--ink2);text-transform:uppercase}
+.foot b{color:var(--red);font-weight:400}
+.pill{display:inline-block;border-radius:99px;padding:1mm 3mm;font-size:7.5pt;letter-spacing:.15em;background:var(--red);color:#fff}
+.dots{display:grid;grid-template-columns:repeat(7,1fr);gap:1.2mm;width:22mm}
+.dots i{aspect-ratio:1;border-radius:.6mm;background:var(--red)}
+.dots i.o{background:transparent}
+table{width:100%;border-collapse:collapse;font-size:8.6pt}
+td{padding:1.6mm 0;border-bottom:1px solid var(--line);vertical-align:top}
+.dark td{border-color:#2a2a2a}
+td:first-child{width:38%}
+.big{font-family:Doto;font-weight:900;font-size:64pt;line-height:.9}
+.tag{font-size:7pt;letter-spacing:.2em;color:var(--red)}
+</style></head><body>
+
+<!-- 01 COVER -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:1.35fr .9fr .55fr">
+    <div class="c" style="grid-column:1/3;display:flex;flex-direction:column;justify-content:space-between">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <img src="img/icon.png" style="width:30mm;border-radius:6mm;border:1px solid var(--line)">
+        <span class="pill">BETA 0.8</span>
+      </div>
+      <div><div class="lab">Manual de usuario</div><h1 style="font-size:62pt">SOUNDWAVE</h1>
+      <p style="margin-top:4mm;color:var(--ink2);max-width:120mm">Un DAW minimalista para hacer música: graba, compón con MIDI, mezcla con nuestros plugins y exporta tu canción.</p></div>
+    </div>
+    <div class="c shot"><img src="img/splash.png" style="object-position:center"></div>
+    <div class="c dark"><div class="lab">Contenido</div>
+      <table>
+        <tr><td>01 Instalar</td><td>02 La interfaz</td></tr>
+        <tr><td>03 Librería</td><td>04 Pistas y envíos</td></tr>
+        <tr><td>05 Regla, loop, zoom</td><td>06 Clips y MIDI</td></tr>
+        <tr><td>07 Grabar</td><td>08 Plugins</td></tr>
+        <tr><td>09 Vista GRID</td><td>10 Exportar</td></tr>
+        <tr><td>11 Los 16 plugins</td><td>12 Atajos y ayuda</td></tr>
+      </table></div>
+    <div class="c red" style="grid-column:1/3;display:flex;align-items:center;justify-content:space-between">
+      <div><div class="lab">Para Windows · Mac Apple Silicon · Mac Intel</div><h3 style="margin:0">Hecho para hacer música, nada más.</h3></div>
+      <div class="dots"><i></i><i class=o></i><i class=o></i><i class=o></i><i class=o></i><i class=o></i><i></i><i></i><i class=o></i><i class=o></i><i></i><i class=o></i><i class=o></i><i></i><i></i><i class=o></i><i></i><i class=o></i><i></i><i class=o></i><i></i><i class=o></i><i></i><i class=o></i><i class=o></i><i class=o></i><i></i><i class=o></i></div>
+    </div>
+  </div>
+  <div class="foot"><span>SoundWave · Beta 0.8</span><b>01</b></div>
+</section>
+
+<!-- 02 INSTALL + FIRST RUN -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr 1fr">
+    <div class="c" style="grid-column:1/3"><span class="num">01</span><div class="lab">Empezar</div><h2>INSTALAR</h2>
+      <p>Descarga el instalador de tu sistema desde la página de descargas del proyecto (Releases → <b>latest</b>).</p></div>
+    <div class="c"><div class="lab">Windows</div><h3>SOUNDWAVE-SETUP.EXE</h3>
+      <ul><li>Ábrelo y sigue los pasos.</li><li>Instala la app, los 16 plugins VST3 (en la carpeta común de VST3) y el acceso directo del escritorio.</li><li>Para desinstalar: Configuración de Windows → Aplicaciones.</li></ul></div>
+    <div class="c"><div class="lab">Mac</div><h3>.DMG</h3>
+      <ul><li><b>M1 a M5</b>: SoundWave-Mac-AppleSilicon.dmg. <b>Intel</b>: SoundWave-Mac-Intel.dmg.</li><li>Arrastra SoundWave a Aplicaciones.</li><li>La primera vez: clic derecho → Abrir → Abrir (la app no está firmada por Apple).</li><li>Nuestros plugins ya van dentro de la app. Para usarlos en otros DAW, copia <i>Plugins/VST3</i> a ~/Library/Audio/Plug-Ins/VST3 y <i>Plugins/AU</i> a …/Components.</li></ul></div>
+    <div class="c shot"><img src="img/tour.png" style="object-position:20% 0"></div>
+    <div class="c dark"><span class="num">!</span><div class="lab">Primera vez</div><h3>TOUR DE BIENVENIDA</h3>
+      <p>Al abrir SoundWave por primera vez, un tour de 10 pasos resalta cada parte de la pantalla y te explica para qué sirve.</p>
+      <ul><li>Avanza con <kbd>→</kbd> o SIGUIENTE, vuelve con <kbd>←</kbd>.</li><li>Ciérralo con <kbd>Esc</kbd> o SALTAR.</li><li>Repítelo cuando quieras: <b>AYUDA → Tour de bienvenida</b>.</li></ul>
+      <p style="margin-top:3mm;color:#9a9a9a">Audio: en SETTINGS → AUDIO elige tu tarjeta de sonido, sus entradas y salidas.</p></div>
+  </div>
+  <div class="foot"><span>Instalar</span><b>02</b></div>
+</section>
+
+<!-- 03 INTERFACE -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr 1fr;grid-template-rows:auto 1.15fr .28fr 1fr">
+    <div class="c" style="grid-column:1/4"><span class="num">02</span><div class="lab">Vista general</div><h2>LA INTERFAZ</h2>
+      <p>Todo está en una sola ventana: la librería a la izquierda, las pistas en el centro y el panel de edición abajo.</p></div>
+    <div class="c shot fit" style="grid-column:1/4"><img src="img/devices.png"></div>
+    <div class="c shot fit" style="grid-column:1/4"><img src="img/topbar.png" style="object-fit:cover;object-position:left center"></div>
+    <div class="c"><div class="lab">A · Barra superior</div><h3>TRANSPORTE</h3>
+      <ul><li>PLAY, STOP, REC y la posición (compás.pulso.semicorchea).</li><li>Tempo: arrastra el número o pulsa TAP al ritmo.</li><li>CLICK: metrónomo. Clic derecho o la flecha: sonido, volumen y cuenta previa.</li><li>LOOP y su longitud. KEY y escala para el piano roll.</li></ul></div>
+    <div class="c"><div class="lab">B · Vistas</div><h3>BOTONES</h3>
+      <ul><li>BROWSER: muestra u oculta la librería.</li><li>PANEL: el panel inferior.</li><li>TIMELINE / GRID: las dos vistas (<kbd>Tab</kbd>).</li><li>TRACK: nueva pista. EXPORT y SETTINGS.</li><li>VER → Personalizar barra: arrastra los botones para reordenarlos.</li></ul></div>
+    <div class="c dark"><div class="lab">C · Panel inferior</div><h3>EDITAR</h3>
+      <ul><li>Izquierda: el piano roll o el editor de audio del clip seleccionado.</li><li>Derecha: DEVICES, la cadena de plugins de la pista.</li><li>Arrastra la pestañita de su borde superior para cambiar su altura.</li></ul></div>
+  </div>
+  <div class="foot"><span>La interfaz</span><b>03</b></div>
+</section>
+
+<!-- 04 LIBRARY -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:.82fr .82fr 1.2fr;grid-template-rows:auto 1fr 1fr">
+    <div class="c" style="grid-column:1/4"><span class="num">03</span><div class="lab">Sonidos y plugins</div><h2>LIBRERÍA</h2>
+      <p>Tres pestañas: SAMPLES (tus carpetas de audio), PLUGINS (todos los plugins instalados) y SOUNDWAVE (solo los nuestros).</p></div>
+    <div class="c shot" style="grid-row:2/4"><img src="img/lib-samples.png"></div>
+    <div class="c shot" style="grid-row:2/4"><img src="img/lib-plugins.png"></div>
+    <div class="c"><div class="lab">Samples</div><h3>TUS SONIDOS</h3>
+      <ul><li><b>+</b> añade una carpeta (por ejemplo tu carpeta de drumkits); <b>−</b> la quita de la lista.</li><li>Con PREVIEW encendido, un clic en un sonido lo escucha.</li><li>Arrastra el sonido a una pista: se coloca donde lo sueltes.</li><li>También puedes arrastrar archivos desde el explorador o el Finder.</li></ul></div>
+    <div class="c dark"><div class="lab">Plugins</div><h3>ARRASTRAR</h3>
+      <ul><li>Busca por nombre o filtra por tipo: dinámica, EQ, reverb, delay, modulación, distorsión, pitch, sinte.</li><li>Agrupados por fabricante. Los de SoundWave tienen el icono rojo.</li><li>Arrástralo a una pista: la pista se rodea de puntos rojos y, al soltar, se enciende un anillo de puntos.</li><li>Los plugins nuevos se buscan solos al abrir la app.</li></ul></div>
+  </div>
+  <div class="foot"><span>Librería</span><b>04</b></div>
+</section>
+
+<!-- 05 TRACKS -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1.1fr 1fr 1fr">
+    <div class="c" style="grid-column:1/3"><span class="num">04</span><div class="lab">Tu canción</div><h2>PISTAS Y ENVÍOS</h2>
+      <p>Hay dos tipos de pista: <b>AUDIO</b> (raya negra) para voz, guitarra o samples, y <b>MIDI</b> (raya roja) para instrumentos virtuales.</p></div>
+    <div class="c shot" style="grid-column:1/3"><img src="img/tracks.png"></div>
+    <div class="c"><div class="lab">Crear</div><h3>NUEVA PISTA</h3>
+      <ul><li>Pista de audio: <kbd>Ctrl+T</kbd>. Pista MIDI: <kbd>Ctrl+Shift+T</kbd>.</li><li>O el botón TRACK, o el menú CREAR.</li><li>Arrastra la cabecera arriba o abajo para reordenar las pistas.</li><li>Haz clic en la cabecera para seleccionarla: se pone negra.</li></ul></div>
+    <div class="c"><div class="lab">Cabecera</div><h3>M · S · FX · O</h3>
+      <ul><li><b>M</b> silencia la pista. <b>S</b> la deja sonando sola.</li><li><b>FX</b> muestra cuántos plugins tiene; clic para verlos.</li><li><b>o</b> la arma para grabar (se pone roja).</li><li>A la derecha, el nombre del instrumento si es MIDI.</li></ul></div>
+    <div class="c shot fit"><img src="img/io.png"></div>
+    <div class="c red"><div class="lab">I/O de cada pista</div><h3>ENTRADA, PAN, A Y B</h3>
+      <ul><li>Entrada: de dónde graba. IN / AUTO / OFF: cuándo la escuchas.</li><li>Knob de pan y fader de volumen.</li><li><b>A</b> y <b>B</b>: cuánto mandas a los retornos <b>A REVERB</b> y <b>B DELAY</b>. Gira a la derecha para más efecto; doble clic, a cero.</li><li>Botón I/O de la regla: muestra u oculta esta columna.</li></ul></div>
+  </div>
+  <div class="foot"><span>Pistas</span><b>05</b></div>
+</section>
+
+<!-- 06 RULER -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto .34fr 1fr 1fr">
+    <div class="c" style="grid-column:1/3"><span class="num">05</span><div class="lab">Moverte por la canción</div><h2>REGLA, LOOP Y ZOOM</h2>
+      <p>La regla de arriba tiene tres franjas: la canción entera, el loop y los números de compás.</p></div>
+    <div class="c shot fit" style="grid-column:1/3"><img src="img/ruler.png"></div>
+    <div class="c"><div class="lab">Regla · 3 franjas</div><h3>LOOP Y ZOOM</h3>
+      <ul><li><b>Arriba</b>: toda la canción en pequeño. Clic o arrastra para ir a otra parte.</li><li><b>LOOP</b>: arrastra para crear el loop; mueve la barra roja o estira sus bordes. Un clic lo enciende o apaga.</li><li><b>Números</b>: aparece la lupa. Arrastra abajo para acercar, arriba para alejar y de lado para moverte.</li></ul></div>
+    <div class="c dark"><div class="lab">Navegar</div><h3>RATÓN</h3>
+      <ul><li>Clic en cualquier punto de una pista: la barra roja (reproducción) va ahí.</li><li>Rueda: subir/bajar. <kbd>Shift</kbd>+rueda: izquierda/derecha.</li><li><kbd>Ctrl</kbd>+rueda: zoom hacia donde apunta el ratón.</li><li><kbd>Alt</kbd>+rueda: altura de las pistas.</li></ul></div>
+    <div class="c" style="grid-column:1/3"><div class="lab">Clips</div><h3>EDITAR CLIPS</h3>
+      <ul><li>Arrastra un clip para moverlo; sus bordes, para recortarlo. Se ajusta a 1/16; mantén <kbd>Alt</kbd> para moverlo libre.</li><li>Cortar en el cursor <kbd>Ctrl+E</kbd> · duplicar <kbd>Ctrl+D</kbd> · borrar <kbd>Supr</kbd>.</li><li>Clic y arrastre horizontal en una zona vacía: selecciona un rango. Clic derecho sobre él → Crear clip MIDI.</li><li>Clic en un clip de audio: abajo se abre su editor con la onda.</li></ul></div>
+  </div>
+  <div class="foot"><span>Regla y clips</span><b>06</b></div>
+</section>
+
+<!-- 06b MIDI -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1.1fr 1fr">
+    <div class="c" style="grid-column:1/3"><span class="num">06</span><div class="lab">Componer</div><h2>MIDI Y PIANO ROLL</h2>
+      <p>Las pistas MIDI tocan instrumentos virtuales, como nuestro sinte SW TIDE.</p></div>
+    <div class="c shot fit" style="grid-column:1/3"><img src="img/pianoroll.png"></div>
+    <div class="c red"><div class="lab">Notas</div><h3>PIANO ROLL</h3>
+      <ul><li>Doble clic en una zona vacía de una pista: nuevo clip MIDI de 1 compás.</li><li>Clic para poner notas, arrastra para moverlas o alargarlas.</li><li>Las notas son rojas; KEY y escala (barra superior) marcan las teclas de la escala.</li></ul></div>
+    <div class="c dark"><div class="lab">Herramientas</div><h3>ARRIBA DEL PIANO</h3>
+      <ul><li><b>GRID</b>: rejilla de las notas (1/16, 1/8…).</li><li><b>LENGTH</b>: largo del clip.</li><li><b>QUANTISE</b>: ajusta las notas a la rejilla.</li><li><b>OCT − / OCT +</b>: sube o baja una octava.</li></ul></div>
+  </div>
+  <div class="foot"><span>MIDI</span><b>07</b></div>
+</section>
+
+<!-- 07 RECORD -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr .6fr">
+    <div class="c" style="grid-column:1/3"><span class="num">07</span><div class="lab">Grabar</div><h2>GRABAR</h2>
+      <p>Graba voz, guitarra o tu teclado MIDI directamente en una pista.</p></div>
+    <div class="c"><div class="lab">Audio · voz, guitarra</div><h3>PASO A PASO</h3>
+      <ul><li>SETTINGS → AUDIO: elige tu tarjeta de sonido y activa sus entradas.</li><li>En la pista, elige la entrada (I/O) y ármala con <b>o</b>.</li><li>Pulsa <kbd>R</kbd> o REC. Mientras graba verás la onda aparecer en directo.</li><li>Los puntos al lado de la entrada son su nivel: si llegan al rojo, baja la ganancia de tu tarjeta.</li></ul></div>
+    <div class="c dark"><div class="lab">MIDI · teclado</div><h3>INSTRUMENTO</h3>
+      <ul><li>Crea una pista MIDI: coge tu teclado como entrada automáticamente.</li><li>Arrastra un sinte (por ejemplo SW TIDE) a la pista.</li><li>Arma y pulsa <kbd>R</kbd>.</li><li>Si REC no tiene ninguna pista armada, arma la seleccionada.</li></ul></div>
+    <div class="c red" style="grid-column:1/3"><div class="lab">Consejo</div><h3>METRÓNOMO Y CUENTA</h3>
+      <p>Enciende CLICK para grabar a tempo. Con clic derecho en CLICK eliges el sonido, el volumen y una cuenta previa antes de empezar a grabar.</p></div>
+  </div>
+  <div class="foot"><span>Grabar</span><b>08</b></div>
+</section>
+
+<!-- 08 PLUGINS -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1.1fr 1fr .8fr">
+    <div class="c" style="grid-column:1/3"><span class="num">08</span><div class="lab">Efectos e instrumentos</div><h2>PLUGINS (DEVICES)</h2>
+      <p>Selecciona una pista: abajo a la derecha verás su cadena de plugins, una tarjeta por plugin.</p></div>
+    <div class="c shot fit" style="grid-column:1/3"><img src="img/devices-card.png"></div>
+    <div class="c"><div class="lab">Cada tarjeta</div><h3>CONTROLES</h3>
+      <ul><li>Knobs: los parámetros. Arrastra arriba/abajo; doble clic, valor por defecto.</li><li><span style="color:var(--red)">⏻</span> encender/apagar · ▢ abrir la ventana completa.</li><li>← → mover · ⧉ duplicar · <span style="color:var(--red)">✕</span> borrar.</li><li>La ventana del plugin queda delante; ciérrala con su X.</li></ul></div>
+    <div class="c dark"><div class="lab">Clic derecho</div><h3>MÁS OPCIONES</h3>
+      <ul><li>Duplicar, Copiar y Pegar después.</li><li>Mover a otra pista.</li><li><b>+ ADD</b> abre el menú de plugins; <b>PASTE</b> pega el copiado al final.</li></ul></div>
+    <div class="c red" style="grid-column:1/3"><div class="lab">Orden</div><h3>ARRASTRAR TARJETAS</h3>
+      <p>Agarra una tarjeta y arrástrala a izquierda o derecha para cambiar el orden. El sonido pasa por los plugins de izquierda a derecha.</p></div>
+  </div>
+  <div class="foot"><span>Plugins</span><b>09</b></div>
+</section>
+
+<!-- 09 GRID + 10 EXPORT -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1.15fr .9fr auto 1.2fr">
+    <div class="c" style="grid-column:1/3"><span class="num">09</span><div class="lab">En directo</div><h2>VISTA GRID</h2>
+      <p>Pulsa <kbd>Tab</kbd> para cambiar entre TIMELINE (la canción de principio a fin) y GRID (clips sueltos para lanzarlos en directo).</p></div>
+    <div class="c shot" style="grid-column:1/3"><img src="img/gridview.png"></div>
+    <div class="c"><div class="lab">Clips y escenas</div><h3>LANZAR</h3>
+      <ul><li>Columnas = pistas, filas = escenas. Arrastra samples a una casilla.</li><li>Clic en una casilla: suena en bucle. STOP la para.</li><li>&gt; 1, &gt; 2… lanzan toda la fila. STOP ALL para todo.</li></ul></div>
+    <div class="c dark"><div class="lab">Mezclador</div><h3>CANALES</h3>
+      <ul><li>Debajo de cada pista: arm, envíos A/B, plugins, M, S y fader.</li><li>A la derecha: A REVERB, B DELAY y MASTER.</li><li>Si no cabe, usa la rueda para bajar.</li></ul></div>
+    <div class="c" style="grid-column:1/3"><span class="num">10</span><div class="lab">Tu canción terminada</div><h2>EXPORTAR</h2></div>
+    <div class="c shot fit"><img src="img/export-dlg.png"></div>
+    <div class="c red"><div class="lab">EXPORT · Ctrl+Shift+R</div><h3>WAV O MP3</h3>
+      <ul><li><b>Formato</b>: WAV (sin pérdida) o MP3.</li><li><b>Bits / frecuencia</b>: 24 bit y 48000 Hz es una buena opción.</li><li><b>Range</b>: toda la canción o solo el loop.</li><li><b>Normalise</b>: sube el volumen al máximo sin saturar.</li><li><b>Include master FX</b>: incluye los plugins del master.</li></ul>
+      <p style="margin-top:2mm;color:#ffd0d0">En Mac Intel por ahora solo WAV.</p></div>
+  </div>
+  <div class="foot"><span>Grid y exportar</span><b>10</b></div>
+</section>
+
+<!-- 11 PLUGINS -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr 1fr 1fr;grid-template-rows:auto repeat(4,1fr)">
+    <div class="c dark" style="grid-column:1/5"><span class="num">11</span><div class="lab">Incluidos, gratis, en VST3 (y AU en Mac)</div><h2>LOS 16 PLUGINS</h2>
+      <p style="color:#bbb">También funcionan en Ableton, FL Studio, Logic, Reaper y cualquier DAW con VST3/AU.</p></div>
+    <div class="c"><div class="tag">DINÁMICA</div><h3>SQUEEZE</h3><p>Compresor con mezcla paralela.</p></div>
+    <div class="c"><div class="tag">DINÁMICA</div><h3>WALL</h3><p>Limitador brickwall para el master: más volumen sin saturar.</p></div>
+    <div class="c"><div class="tag">DINÁMICA</div><h3>GATE</h3><p>Puerta de ruido: corta el sonido por debajo del umbral.</p></div>
+    <div class="c"><div class="tag">EQ</div><h3>PRISM</h3><p>Ecualizador paramétrico de 6 bandas.</p></div>
+    <div class="c"><div class="tag">EQ</div><h3>FLUX</h3><p>EQ dinámico: una banda que solo recorta cuando esa zona suena fuerte.</p></div>
+    <div class="c"><div class="tag">REVERB</div><h3>SPACE</h3><p>Reverb algorítmica con pre-delay y corte de graves en la cola.</p></div>
+    <div class="c"><div class="tag">REVERB</div><h3>ROOM</h3><p>Reverb de convolución: carga cualquier respuesta de impulso WAV/AIFF. Trae 3 espacios.</p></div>
+    <div class="c"><div class="tag">DELAY</div><h3>ECHO</h3><p>Delay estéreo / ping-pong sincronizado al tempo, con filtro en la realimentación.</p></div>
+    <div class="c"><div class="tag">MODULACIÓN</div><h3>SWIRL</h3><p>Chorus.</p></div>
+    <div class="c"><div class="tag">MODULACIÓN</div><h3>JET</h3><p>Flanger.</p></div>
+    <div class="c"><div class="tag">MODULACIÓN</div><h3>ORBIT</h3><p>Phaser.</p></div>
+    <div class="c"><div class="tag">MODULACIÓN</div><h3>SWAY</h3><p>Auto-pan / trémolo, libre o al tempo.</p></div>
+    <div class="c"><div class="tag">DISTORSIÓN</div><h3>GLOW</h3><p>Saturación tipo válvula.</p></div>
+    <div class="c"><div class="tag">DISTORSIÓN</div><h3>CRUSH</h3><p>Bitcrusher: reduce bits y frecuencia de muestreo.</p></div>
+    <div class="c red"><div class="tag" style="color:#fff">PITCH</div><h3>TUNE</h3><p>Corrección de afinación en tiempo real para voces.</p></div>
+    <div class="c red"><div class="tag" style="color:#fff">SINTE</div><h3>TIDE</h3><p>Sinte wavetable: 2 osciladores, unison, filtro, 2 envolventes y LFO.</p></div>
+  </div>
+  <div class="foot"><span>Los 16 plugins</span><b>11</b></div>
+</section>
+
+<!-- 12 SHORTCUTS + HELP -->
+<section class="page">
+  <div class="grid" style="grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr auto">
+    <div class="c" style="grid-column:1/3"><span class="num">12</span><div class="lab">Más rápido</div><h2>ATAJOS Y AYUDA</h2>
+      <p>En Mac usa <kbd>Cmd</kbd> donde pone <kbd>Ctrl</kbd>.</p></div>
+    <div class="c"><div class="lab">Teclado</div>
+      <table>
+        <tr><td><kbd>Espacio</kbd></td><td>Play / pausa</td></tr>
+        <tr><td><kbd>R</kbd></td><td>Grabar</td></tr>
+        <tr><td><kbd>Inicio</kbd></td><td>Volver al principio</td></tr>
+        <tr><td><kbd>Tab</kbd></td><td>TIMELINE / GRID</td></tr>
+        <tr><td><kbd>Ctrl+T</kbd></td><td>Pista de audio</td></tr>
+        <tr><td><kbd>Ctrl+Shift+T</kbd></td><td>Pista MIDI</td></tr>
+        <tr><td><kbd>Ctrl+Shift+M</kbd></td><td>Clip MIDI en el cursor</td></tr>
+        <tr><td><kbd>Ctrl+E</kbd></td><td>Cortar clip</td></tr>
+        <tr><td><kbd>Ctrl+D</kbd></td><td>Duplicar clip</td></tr>
+        <tr><td><kbd>Supr</kbd></td><td>Borrar clip</td></tr>
+        <tr><td><kbd>Ctrl+L</kbd></td><td>Loop</td></tr>
+        <tr><td><kbd>Ctrl+Z</kbd> · <kbd>Ctrl+Y</kbd></td><td>Deshacer · rehacer</td></tr>
+        <tr><td><kbd>Ctrl+S</kbd> · <kbd>Ctrl+O</kbd></td><td>Guardar · abrir</td></tr>
+        <tr><td><kbd>Ctrl+Shift+R</kbd></td><td>Exportar</td></tr>
+        <tr><td><kbd>Ctrl+Alt+B</kbd> · <kbd>Ctrl+Alt+L</kbd></td><td>Librería · panel</td></tr>
+      </table></div>
+    <div class="c dark"><div class="lab">Si algo falla</div><h3>SOLUCIONES</h3>
+      <ul><li><b>No suena</b>: SETTINGS → AUDIO, elige la salida correcta.</li><li><b>No graba</b>: activa las entradas en SETTINGS → AUDIO, elige la entrada de la pista y ármala.</li><li><b>No veo un plugin</b>: SETTINGS → PLUGINS → buscar. Si un plugin bloquea la búsqueda, SoundWave lo salta solo.</li><li><b>Mac no abre la app</b>: clic derecho → Abrir.</li><li><b>Registro</b>: SoundWave.log en la carpeta de ajustes (%APPDATA%\SoundWave en Windows).</li></ul>
+      <p style="margin-top:3mm;color:#9a9a9a">Ratón: <kbd>Alt</kbd> al arrastrar = sin rejilla · doble clic en un knob = valor por defecto.</p></div>
+    <div class="c red" style="grid-column:1/3;display:flex;justify-content:space-between;align-items:center">
+      <div><div class="lab">SoundWave · Beta 0.8 · Código abierto (GPLv3)</div><h3 style="margin:0">A HACER MÚSICA.</h3></div>
+      <img src="img/icon.png" style="width:18mm;border-radius:4mm">
+    </div>
+  </div>
+  <div class="foot"><span>Atajos y ayuda</span><b>12</b></div>
+</section>
+</body></html>

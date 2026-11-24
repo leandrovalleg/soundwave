@@ -159,13 +159,15 @@ jobs:
     if: ${{ !cancelled() && (needs.build.result == 'success' || needs.mac.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: docs }
       - uses: actions/download-artifact@v4
       - name: Publish installers (direct downloads)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=$(ls windows/*.exe mac-*/*.dmg 2>/dev/null || true)
+          files=$(ls windows/*.exe mac-*/*.dmg docs/SoundWave-Manual.pdf 2>/dev/null || true)
           gh release delete latest --yes --cleanup-tag -R "$GITHUB_REPOSITORY" || true
           gh release create latest $files --prerelease -R "$GITHUB_REPOSITORY" \
             --title "SoundWave (última versión)" \
-            --notes "Windows: SoundWave-Setup.exe. Mac M1/M2/M3/M4: SoundWave-Mac-AppleSilicon.dmg. Mac Intel: SoundWave-Mac-Intel.dmg (abre, arrastra a Aplicaciones; la primera vez clic derecho > Abrir)."
+            --notes "Windows: SoundWave-Setup.exe. Mac M1/M2/M3/M4: SoundWave-Mac-AppleSilicon.dmg. Mac Intel: SoundWave-Mac-Intel.dmg (abre, arrastra a Aplicaciones; la primera vez clic derecho > Abrir). Manual: SoundWave-Manual.pdf."
